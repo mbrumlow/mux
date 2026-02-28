@@ -60,6 +60,8 @@ pub struct Terminal {
     pending_osc: Vec<u8>,
     /// Previous frame for computing diffs.
     prev_frame: Option<PrevFrame>,
+    /// Whether the application has an active synchronized update (DEC mode 2026).
+    app_sync_active: bool,
     size: (u16, u16),
 }
 
@@ -87,6 +89,7 @@ impl Terminal {
             dec_modes: BTreeSet::new(),
             pending_osc: Vec::new(),
             prev_frame: None,
+            app_sync_active: false,
             size: (rows, cols),
         }
     }
@@ -105,6 +108,7 @@ impl Terminal {
             &mut dec_mode_changes,
             &mut client_forwards,
             &mut self.pending_osc,
+            &mut self.app_sync_active,
         );
 
         // wezterm-term handles ALL VT emulation and query responses
@@ -134,6 +138,11 @@ impl Terminal {
     /// Current KKP flags (0 = disabled / legacy mode).
     pub fn kkp_flags(&self) -> u32 {
         self.kkp_stack.last().copied().unwrap_or(0)
+    }
+
+    /// Whether the application has an active synchronized update (DEC 2026).
+    pub fn is_app_sync_active(&self) -> bool {
+        self.app_sync_active
     }
 
     pub fn snapshot(&mut self) -> ScreenSnapshot {
@@ -761,6 +770,7 @@ fn scan_pty_output(
     dec_mode_changes: &mut Vec<(u16, bool)>,
     client_forwards: &mut Vec<Vec<u8>>,
     pending_osc: &mut Vec<u8>,
+    app_sync_active: &mut bool,
 ) {
     let mut i = 0;
 
@@ -816,7 +826,11 @@ fn scan_pty_output(
                     if let Ok(params_str) = std::str::from_utf8(&data[i + 3..j]) {
                         for param in params_str.split(';') {
                             if let Ok(mode) = param.parse::<u16>() {
-                                if FORWARDED_DEC_MODES.contains(&mode) {
+                                if mode == 2026 {
+                                    // Synchronized update — track internally,
+                                    // don't forward to client (we handle it).
+                                    *app_sync_active = enabled;
+                                } else if FORWARDED_DEC_MODES.contains(&mode) {
                                     let changed = if enabled {
                                         dec_modes.insert(mode)
                                     } else {

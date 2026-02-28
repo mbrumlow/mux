@@ -135,12 +135,20 @@ impl Session {
         // Maximum latency cap — send a diff at least this often during
         // continuous output (keeps responsiveness for fast-scrolling).
         const MAX_LATENCY_MS: u64 = 16;
+        // Maximum time to honour an app's synchronized update (DEC 2026)
+        // before force-rendering. Prevents hangs if the app never sends
+        // the closing sequence.
+        const MAX_SYNC_MS: u64 = 500;
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
         )?;
 
         loop {
+            // Capture sync state before select — can't borrow self inside
+            // the async block since other branches need &mut self.
+            let app_sync = self.terminal.is_app_sync_active();
+
             // biased; ensures deterministic priority:
             // client input > signals > PTY output > screen updates > new connections
             tokio::select! {
@@ -319,10 +327,19 @@ impl Session {
                 }
 
                 // ── Debounced render: wait for PTY quiescence or max latency ──
+                // During an app synchronized update (DEC 2026), we delay
+                // rendering until the app signals completion (or a safety
+                // timeout expires) so we never send a half-drawn frame.
                 _ = async {
-                    let quiesce_at = last_pty_at.unwrap() + Duration::from_millis(QUIESCE_MS);
-                    let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_LATENCY_MS);
-                    tokio::time::sleep_until(quiesce_at.min(max_at)).await;
+                    if app_sync {
+                        // App has an active sync update — wait up to MAX_SYNC_MS
+                        let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_SYNC_MS);
+                        tokio::time::sleep_until(max_at).await;
+                    } else {
+                        let quiesce_at = last_pty_at.unwrap() + Duration::from_millis(QUIESCE_MS);
+                        let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_LATENCY_MS);
+                        tokio::time::sleep_until(quiesce_at.min(max_at)).await;
+                    }
                 }, if client.is_some() && dirty => {
                     if let Some(data) = self.terminal.screen_diff() {
                         let conn = client.as_mut().unwrap();
