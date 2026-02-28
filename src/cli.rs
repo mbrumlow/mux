@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mux")]
+#[command(name = "mux", version = env!("MUX_VERSION"))]
 pub struct Cli {
     /// Session name to attach to or create
     pub name: Option<String>,

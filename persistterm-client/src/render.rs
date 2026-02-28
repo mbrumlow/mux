@@ -94,6 +94,34 @@ pub fn render_kicked_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std
     out.flush()
 }
 
+pub fn render_session_ended_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std::io::Result<()> {
+    // Clear screen, reset attributes, hide cursor
+    write!(out, "\x1b[0m\x1b[2J\x1b[?25l")?;
+
+    let lines: &[&str] = &[
+        "Session has ended.",
+        "",
+        "Press any key to exit.",
+    ];
+
+    let start_row = rows.saturating_sub(lines.len() as u16) / 2 + 1;
+
+    for (i, line) in lines.iter().enumerate() {
+        let row = start_row + i as u16;
+        let col = cols.saturating_sub(line.len() as u16) / 2 + 1;
+        write!(out, "\x1b[{row};{col}H")?;
+        if i == 0 {
+            write!(out, "\x1b[1m{line}\x1b[0m")?;
+        } else if i == 2 {
+            write!(out, "\x1b[7m{line}\x1b[0m")?;
+        } else {
+            write!(out, "{line}")?;
+        }
+    }
+
+    out.flush()
+}
+
 fn emit_sgr<W: Write>(out: &mut W, style: &CellStyle) -> std::io::Result<()> {
     // Reset then apply
     write!(out, "\x1b[0")?;

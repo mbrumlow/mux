@@ -58,6 +58,21 @@ async fn notify_next_waiting(waiting: &mut VecDeque<WaitingClient>) {
     }
 }
 
+/// Notify all connected clients (active + waiting) that the session has ended.
+async fn notify_session_ended(
+    client: &mut Option<ClientConn>,
+    waiting: &mut VecDeque<WaitingClient>,
+) {
+    if let Some(conn) = client.as_mut() {
+        let _ = write_frame_async(&mut conn.writer, &S2C::SessionEnded).await;
+    }
+    for w in waiting.iter_mut() {
+        if !w.dead.load(Ordering::Relaxed) {
+            let _ = write_frame_async(&mut w.writer, &S2C::SessionEnded).await;
+        }
+    }
+}
+
 /// A clonable writer wrapper so both session and wezterm-term can write to the PTY.
 struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
 
@@ -196,6 +211,7 @@ impl Session {
                         }
                         Some(C2S::KillSession) => {
                             info!("client requested session kill");
+                            notify_session_ended(&mut client, &mut waiting).await;
                             waiting.clear();
                             return Ok(());
                         }
@@ -223,6 +239,7 @@ impl Session {
                 // ── SIGTERM → clean shutdown ──────────────────────────
                 _ = sigterm.recv() => {
                     info!("received SIGTERM, shutting down");
+                    notify_session_ended(&mut client, &mut waiting).await;
                     waiting.clear();
                     return Ok(());
                 }
@@ -320,6 +337,7 @@ impl Session {
                         }
                         None => {
                             info!("shell exited, ending session");
+                            notify_session_ended(&mut client, &mut waiting).await;
                             waiting.clear();
                             return Ok(());
                         }

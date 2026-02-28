@@ -212,6 +212,11 @@ async fn run_session(
                             exit_reason = ExitReason::Kicked(reason);
                             break;
                         }
+                        Some(S2C::SessionEnded) => {
+                            info!("session ended");
+                            exit_reason = ExitReason::ServerDisconnected;
+                            break;
+                        }
                         Some(S2C::Pong { .. }) => {}
                         Some(_) => {}
                         None => {
@@ -265,6 +270,12 @@ async fn run_session(
                                 stdout.flush()?;
                                 break;
                             }
+                            Ok(S2C::SessionEnded) => {
+                                info!("session ended");
+                                exit_reason = ExitReason::ServerDisconnected;
+                                stdout.flush()?;
+                                break;
+                            }
                             Ok(S2C::Pong { .. }) => {}
                             Ok(_) => {}
                             Err(_) => break,
@@ -294,6 +305,7 @@ async fn run_session(
 /// Action from the kicked overlay.
 enum OverlayAction {
     Reconnect,
+    SessionEnded,
     Exit,
 }
 
@@ -328,11 +340,12 @@ async fn wait_for_overlay_action(
                 }
             } => {
                 match msg {
+                    Some(S2C::SessionEnded) => return OverlayAction::SessionEnded,
                     Some(S2C::SessionAvailable) => return OverlayAction::Reconnect,
-                    Some(_) => {} // ignore other messages
+                    Some(_) => {}
                     None => {
-                        // Server gone — disable this branch
-                        server_rx = None;
+                        // Server gone (connection dropped) — session is gone
+                        return OverlayAction::SessionEnded;
                     }
                 }
             }
@@ -365,6 +378,15 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                     OverlayAction::Reconnect => {
                         info!("reclaiming session after kick");
                         continue;
+                    }
+                    OverlayAction::SessionEnded => {
+                        // Update overlay to show session ended, wait for key
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let mut stdout = std::io::stdout();
+                        let _ = render::render_session_ended_overlay(&mut stdout, cols, rows);
+                        // Wait for any key to dismiss
+                        let _ = stdin_rx.recv().await;
+                        break Ok(Some(ExitReason::ServerDisconnected));
                     }
                     OverlayAction::Exit => {
                         break Ok(Some(ExitReason::Kicked(reason)));

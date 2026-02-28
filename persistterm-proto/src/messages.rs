@@ -33,4 +33,5 @@ pub enum S2C {
     ScreenData { data: Vec<u8> },
     ScreenDiff { data: Vec<u8> },
     SessionAvailable,
+    SessionEnded,
 }
