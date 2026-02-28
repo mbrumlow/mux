@@ -1,0 +1,11 @@
+[package]
+name = "persistterm-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+persistterm-proto = { path = "../persistterm-proto", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+crossterm = "0.28"
+tracing = "0.1"
+anyhow = "1"

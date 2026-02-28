@@ -1,0 +1,20 @@
+# Rust
+/target
+
+# Nix
+result
+result-*
+
+# direnv
+.direnv
+.envrc
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store

@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "persistterm-proto",
+    "persistterm-server",
+    "persistterm-client",
+]
+resolver = "2"
+
+[package]
+name = "mux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+persistterm-server = { path = "persistterm-server" }
+persistterm-client = { path = "persistterm-client" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+libc = "0.2"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
