@@ -133,146 +133,12 @@ impl Session {
         )?;
 
         loop {
+            // biased; ensures deterministic priority:
+            // client input > signals > screen updates > new connections > PTY output
             tokio::select! {
-                // ── SIGTERM → clean shutdown ──────────────────────────
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM, shutting down");
-                    waiting.clear();
-                    return Ok(());
-                }
-                // ── PTY output (always active) ──────────────────────────
-                data = self.pty_rx.recv() => {
-                    match data {
-                        Some(first) => {
-                            // Process the first chunk
-                            let mut all_events = self.terminal.process(&first);
+                biased;
 
-                            // Drain all queued PTY data so we see the final
-                            // state of the app's redraw, not an intermediate
-                            // one (e.g. cursor hidden mid-redraw).
-                            while let Ok(more) = self.pty_rx.try_recv() {
-                                let ev = self.terminal.process(&more);
-                                // Merge events: last KKP wins, append the rest
-                                if ev.kkp_changed.is_some() {
-                                    all_events.kkp_changed = ev.kkp_changed;
-                                }
-                                all_events.dec_mode_changes.extend(ev.dec_mode_changes);
-                                all_events.osc_forwards.extend(ev.osc_forwards);
-                            }
-
-                            // Forward KKP mode changes to client
-                            if let Some(flags) = all_events.kkp_changed {
-                                info!(flags, "KKP mode changed");
-                                if let Some(conn) = client.as_mut() {
-                                    if let Err(e) = write_frame_async(
-                                        &mut conn.writer,
-                                        &S2C::SetKkpMode { flags },
-                                    ).await {
-                                        warn!("failed to send KKP mode, dropping client: {e}");
-                                        drop(client.take());
-                                        notify_next_waiting(&mut waiting).await;
-                                    }
-                                }
-                            }
-
-                            // Forward DEC private mode changes to client
-                            for &(mode, enabled) in &all_events.dec_mode_changes {
-                                info!(mode, enabled, "DEC private mode changed");
-                                if let Some(conn) = client.as_mut() {
-                                    if let Err(e) = write_frame_async(
-                                        &mut conn.writer,
-                                        &S2C::SetDecMode { mode, enabled },
-                                    ).await {
-                                        warn!("failed to send DEC mode, dropping client: {e}");
-                                        drop(client.take());
-                                        notify_next_waiting(&mut waiting).await;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Forward OSC sequences (clipboard etc.) to client
-                            if !all_events.osc_forwards.is_empty() {
-                                if let Some(conn) = client.as_mut() {
-                                    for osc_body in &all_events.osc_forwards {
-                                        // Parse "52;PARAMS;DATA" from the body
-                                        if let Ok(body_str) = std::str::from_utf8(osc_body) {
-                                            if let Some(rest) = body_str.strip_prefix("52;") {
-                                                if let Some((params, data)) = rest.split_once(';') {
-                                                    if let Err(e) = write_frame_async(
-                                                        &mut conn.writer,
-                                                        &S2C::Clipboard {
-                                                            params: params.to_string(),
-                                                            data: data.to_string(),
-                                                        },
-                                                    ).await {
-                                                        warn!("failed to send clipboard, dropping client: {e}");
-                                                        drop(client.take());
-                                                        notify_next_waiting(&mut waiting).await;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            dirty = true;
-                        }
-                        None => {
-                            info!("shell exited, ending session");
-                            waiting.clear();
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // ── Accept new client (kick existing only after handshake) ──
-                result = self.listener.accept() => {
-                    match result {
-                        Ok(stream) => {
-                            // Complete handshake BEFORE kicking, so that
-                            // probe connections (e.g. --list liveness check)
-                            // that never send Hello don't disrupt the
-                            // active client.
-                            match self.accept_client(stream).await {
-                                Ok(conn) => {
-                                    if let Some(mut old) = client.take() {
-                                        let _ = write_frame_async(
-                                            &mut old.writer,
-                                            &S2C::Kicked { reason: "another client connected".to_string() },
-                                        ).await;
-                                        waiting.push_back(kick_to_waiting(old));
-                                    }
-                                    client = Some(conn);
-                                    dirty = false;
-                                }
-                                Err(e) => {
-                                    warn!("client handshake failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("accept error: {e}");
-                        }
-                    }
-                }
-
-                // ── Timer tick → send diff if dirty ──────────────────────
-                _ = interval.tick(), if client.is_some() && dirty => {
-                    if let Some(data) = self.terminal.screen_diff() {
-                        let conn = client.as_mut().unwrap();
-                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
-                            warn!("failed to send screen diff, dropping client: {e}");
-                            drop(client.take());
-                            notify_next_waiting(&mut waiting).await;
-                        }
-                    }
-                    dirty = false;
-                }
-
-                // ── Client messages ─────────────────────────────────────
+                // ── Client messages (highest priority) ──────────────────
                 msg = async {
                     match client.as_mut() {
                         Some(c) => c.msg_rx.recv().await,
@@ -334,6 +200,146 @@ impl Session {
                             info!("client disconnected");
                             drop(client.take());
                             notify_next_waiting(&mut waiting).await;
+                        }
+                    }
+                }
+
+                // ── SIGTERM → clean shutdown ──────────────────────────
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down");
+                    waiting.clear();
+                    return Ok(());
+                }
+
+                // ── Timer tick → send diff if dirty ──────────────────────
+                _ = interval.tick(), if client.is_some() && dirty => {
+                    if let Some(data) = self.terminal.screen_diff() {
+                        let conn = client.as_mut().unwrap();
+                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                            warn!("failed to send screen diff, dropping client: {e}");
+                            drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
+                        }
+                    }
+                    dirty = false;
+                }
+
+                // ── Accept new client (kick existing only after handshake) ──
+                result = self.listener.accept() => {
+                    match result {
+                        Ok(stream) => {
+                            match self.accept_client(stream).await {
+                                Ok(conn) => {
+                                    if let Some(mut old) = client.take() {
+                                        let _ = write_frame_async(
+                                            &mut old.writer,
+                                            &S2C::Kicked { reason: "another client connected".to_string() },
+                                        ).await;
+                                        waiting.push_back(kick_to_waiting(old));
+                                    }
+                                    client = Some(conn);
+                                    dirty = false;
+                                }
+                                Err(e) => {
+                                    warn!("client handshake failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("accept error: {e}");
+                        }
+                    }
+                }
+
+                // ── PTY output (lowest priority) ──────────────────────────
+                data = self.pty_rx.recv() => {
+                    match data {
+                        Some(first) => {
+                            // Process the first chunk
+                            let mut all_events = self.terminal.process(&first);
+
+                            // Drain queued PTY data so we see the final state of
+                            // the app's redraw (e.g. cursor hidden mid-redraw).
+                            // Cap iterations so we yield back to handle input.
+                            let mut drained = 0;
+                            while drained < 64 {
+                                match self.pty_rx.try_recv() {
+                                    Ok(more) => {
+                                        let ev = self.terminal.process(&more);
+                                        if ev.kkp_changed.is_some() {
+                                            all_events.kkp_changed = ev.kkp_changed;
+                                        }
+                                        all_events.dec_mode_changes.extend(ev.dec_mode_changes);
+                                        all_events.osc_forwards.extend(ev.osc_forwards);
+                                        drained += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            // Forward KKP mode changes to client
+                            if let Some(flags) = all_events.kkp_changed {
+                                info!(flags, "KKP mode changed");
+                                if let Some(conn) = client.as_mut() {
+                                    if let Err(e) = write_frame_async(
+                                        &mut conn.writer,
+                                        &S2C::SetKkpMode { flags },
+                                    ).await {
+                                        warn!("failed to send KKP mode, dropping client: {e}");
+                                        drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
+                                    }
+                                }
+                            }
+
+                            // Forward DEC private mode changes to client
+                            for &(mode, enabled) in &all_events.dec_mode_changes {
+                                info!(mode, enabled, "DEC private mode changed");
+                                if let Some(conn) = client.as_mut() {
+                                    if let Err(e) = write_frame_async(
+                                        &mut conn.writer,
+                                        &S2C::SetDecMode { mode, enabled },
+                                    ).await {
+                                        warn!("failed to send DEC mode, dropping client: {e}");
+                                        drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Forward OSC sequences (clipboard etc.) to client
+                            if !all_events.osc_forwards.is_empty() {
+                                if let Some(conn) = client.as_mut() {
+                                    for osc_body in &all_events.osc_forwards {
+                                        if let Ok(body_str) = std::str::from_utf8(osc_body) {
+                                            if let Some(rest) = body_str.strip_prefix("52;") {
+                                                if let Some((params, data)) = rest.split_once(';') {
+                                                    if let Err(e) = write_frame_async(
+                                                        &mut conn.writer,
+                                                        &S2C::Clipboard {
+                                                            params: params.to_string(),
+                                                            data: data.to_string(),
+                                                        },
+                                                    ).await {
+                                                        warn!("failed to send clipboard, dropping client: {e}");
+                                                        drop(client.take());
+                                                        notify_next_waiting(&mut waiting).await;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            dirty = true;
+                        }
+                        None => {
+                            info!("shell exited, ending session");
+                            waiting.clear();
+                            return Ok(());
                         }
                     }
                 }
