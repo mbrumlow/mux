@@ -49,10 +49,11 @@ pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // Open log file in append mode
+    // Open log file, truncating any previous content
     let log_file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(paths::log_path(name))
         .context("failed to open log file")?;
 

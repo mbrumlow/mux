@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -58,10 +58,33 @@ async fn notify_next_waiting(waiting: &mut VecDeque<WaitingClient>) {
     }
 }
 
+/// A clonable writer wrapper so both session and wezterm-term can write to the PTY.
+struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl SharedWriter {
+    fn new(writer: Box<dyn Write + Send>) -> Self {
+        Self(Arc::new(Mutex::new(writer)))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn Write + Send> {
+        Box::new(SharedWriter(Arc::clone(&self.0)))
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 pub struct Session {
     name: String,
     pty: PtyHandle,
-    pty_writer: Box<dyn Write + Send>,
+    pty_writer: SharedWriter,
     terminal: Terminal,
     listener: Listener,
     pty_rx: mpsc::Receiver<Vec<u8>>,
@@ -77,7 +100,9 @@ impl Session {
         extra_env: &[(String, String)],
     ) -> Result<Self> {
         let (pty, pty_reader, pty_writer) = PtyHandle::spawn(rows, cols, program, name, extra_env)?;
-        let terminal = Terminal::new(rows, cols);
+        let shared = SharedWriter::new(pty_writer);
+        let term_writer = shared.clone_boxed();
+        let terminal = Terminal::new(rows, cols, term_writer);
         let listener = Listener::bind(sock_path)?;
 
         // Spawn blocking reader for PTY output
@@ -89,7 +114,7 @@ impl Session {
         Ok(Self {
             name: name.to_string(),
             pty,
-            pty_writer,
+            pty_writer: shared,
             terminal,
             listener,
             pty_rx,
@@ -118,21 +143,25 @@ impl Session {
                 // ── PTY output (always active) ──────────────────────────
                 data = self.pty_rx.recv() => {
                     match data {
-                        Some(data) => {
-                            let events = self.terminal.process(&data);
+                        Some(first) => {
+                            // Process the first chunk
+                            let mut all_events = self.terminal.process(&first);
 
-                            // Inject terminal query responses back into PTY
-                            if !events.pty_responses.is_empty() {
-                                for response in &events.pty_responses {
-                                    if let Err(e) = self.pty_writer.write_all(response) {
-                                        error!("failed to inject terminal query response: {e}");
-                                    }
+                            // Drain all queued PTY data so we see the final
+                            // state of the app's redraw, not an intermediate
+                            // one (e.g. cursor hidden mid-redraw).
+                            while let Ok(more) = self.pty_rx.try_recv() {
+                                let ev = self.terminal.process(&more);
+                                // Merge events: last KKP wins, append the rest
+                                if ev.kkp_changed.is_some() {
+                                    all_events.kkp_changed = ev.kkp_changed;
                                 }
-                                let _ = self.pty_writer.flush();
+                                all_events.dec_mode_changes.extend(ev.dec_mode_changes);
+                                all_events.osc_forwards.extend(ev.osc_forwards);
                             }
 
                             // Forward KKP mode changes to client
-                            if let Some(flags) = events.kkp_changed {
+                            if let Some(flags) = all_events.kkp_changed {
                                 info!(flags, "KKP mode changed");
                                 if let Some(conn) = client.as_mut() {
                                     if let Err(e) = write_frame_async(
@@ -147,7 +176,7 @@ impl Session {
                             }
 
                             // Forward DEC private mode changes to client
-                            for &(mode, enabled) in &events.dec_mode_changes {
+                            for &(mode, enabled) in &all_events.dec_mode_changes {
                                 info!(mode, enabled, "DEC private mode changed");
                                 if let Some(conn) = client.as_mut() {
                                     if let Err(e) = write_frame_async(
@@ -163,9 +192,9 @@ impl Session {
                             }
 
                             // Forward OSC sequences (clipboard etc.) to client
-                            if !events.osc_forwards.is_empty() {
+                            if !all_events.osc_forwards.is_empty() {
                                 if let Some(conn) = client.as_mut() {
-                                    for osc_body in &events.osc_forwards {
+                                    for osc_body in &all_events.osc_forwards {
                                         // Parse "52;PARAMS;DATA" from the body
                                         if let Ok(body_str) = std::str::from_utf8(osc_body) {
                                             if let Some(rest) = body_str.strip_prefix("52;") {
@@ -385,7 +414,7 @@ impl Session {
 }
 
 fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 16384];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
