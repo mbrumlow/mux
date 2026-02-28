@@ -82,6 +82,12 @@ async fn run_session(
                 .ok()
                 .filter(|s| !s.is_empty())
                 .or_else(|| std::env::var("HOST").ok().filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    hostname::get()
+                        .ok()
+                        .and_then(|s| s.into_string().ok())
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or_else(|| "unknown".to_string());
         let mut stdout = std::io::stdout();
         let _ = write!(stdout, "\x1b]0;{hostname}/{session_name}\x07");
