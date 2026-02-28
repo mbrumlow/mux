@@ -78,7 +78,9 @@ async fn run_session(
 
     // Set terminal title to HOSTNAME/session_name
     {
-        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+        let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("HOST"))
+                .unwrap_or_else(|_| "unknown".to_string());
         let mut stdout = std::io::stdout();
         let _ = write!(stdout, "\x1b]0;{hostname}/{session_name}\x07");
         let _ = stdout.flush();
