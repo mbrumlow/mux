@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
 
+const VERSION: &str = match option_env!("MUX_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "mux", version = env!("MUX_VERSION"))]
+#[command(name = "mux", version = VERSION)]
 pub struct Cli {
     /// Session name to attach to or create
     pub name: Option<String>,
