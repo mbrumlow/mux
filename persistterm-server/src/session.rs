@@ -125,8 +125,16 @@ impl Session {
         let mut client: Option<ClientConn> = None;
         let mut waiting: VecDeque<WaitingClient> = VecDeque::new();
         let mut dirty = false;
-        let mut interval = tokio::time::interval(Duration::from_millis(16));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Debounce timestamps: wait for PTY output to go quiet before sending
+        // a diff so we capture complete application redraws (e.g. emacs
+        // updating btop in a split pane) rather than intermediate states.
+        let mut dirty_since: Option<tokio::time::Instant> = None;
+        let mut last_pty_at: Option<tokio::time::Instant> = None;
+        // How long to wait after the last PTY data before sending a diff.
+        const QUIESCE_MS: u64 = 3;
+        // Maximum latency cap — send a diff at least this often during
+        // continuous output (keeps responsiveness for fast-scrolling).
+        const MAX_LATENCY_MS: u64 = 16;
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -134,7 +142,7 @@ impl Session {
 
         loop {
             // biased; ensures deterministic priority:
-            // client input > signals > screen updates > new connections > PTY output
+            // client input > signals > PTY output > screen updates > new connections
             tokio::select! {
                 biased;
 
@@ -211,47 +219,7 @@ impl Session {
                     return Ok(());
                 }
 
-                // ── Timer tick → send diff if dirty ──────────────────────
-                _ = interval.tick(), if client.is_some() && dirty => {
-                    if let Some(data) = self.terminal.screen_diff() {
-                        let conn = client.as_mut().unwrap();
-                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
-                            warn!("failed to send screen diff, dropping client: {e}");
-                            drop(client.take());
-                            notify_next_waiting(&mut waiting).await;
-                        }
-                    }
-                    dirty = false;
-                }
-
-                // ── Accept new client (kick existing only after handshake) ──
-                result = self.listener.accept() => {
-                    match result {
-                        Ok(stream) => {
-                            match self.accept_client(stream).await {
-                                Ok(conn) => {
-                                    if let Some(mut old) = client.take() {
-                                        let _ = write_frame_async(
-                                            &mut old.writer,
-                                            &S2C::Kicked { reason: "another client connected".to_string() },
-                                        ).await;
-                                        waiting.push_back(kick_to_waiting(old));
-                                    }
-                                    client = Some(conn);
-                                    dirty = false;
-                                }
-                                Err(e) => {
-                                    warn!("client handshake failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("accept error: {e}");
-                        }
-                    }
-                }
-
-                // ── PTY output (lowest priority) ──────────────────────────
+                // ── PTY output ────────────────────────────────────────
                 data = self.pty_rx.recv() => {
                     match data {
                         Some(first) => {
@@ -334,12 +302,64 @@ impl Session {
                                 }
                             }
 
+                            // Update debounce timestamps
+                            let now = tokio::time::Instant::now();
+                            if dirty_since.is_none() {
+                                dirty_since = Some(now);
+                            }
+                            last_pty_at = Some(now);
                             dirty = true;
                         }
                         None => {
                             info!("shell exited, ending session");
                             waiting.clear();
                             return Ok(());
+                        }
+                    }
+                }
+
+                // ── Debounced render: wait for PTY quiescence or max latency ──
+                _ = async {
+                    let quiesce_at = last_pty_at.unwrap() + Duration::from_millis(QUIESCE_MS);
+                    let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_LATENCY_MS);
+                    tokio::time::sleep_until(quiesce_at.min(max_at)).await;
+                }, if client.is_some() && dirty => {
+                    if let Some(data) = self.terminal.screen_diff() {
+                        let conn = client.as_mut().unwrap();
+                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                            warn!("failed to send screen diff, dropping client: {e}");
+                            drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
+                        }
+                    }
+                    dirty = false;
+                    dirty_since = None;
+                    last_pty_at = None;
+                }
+
+                // ── Accept new client (kick existing only after handshake) ──
+                result = self.listener.accept() => {
+                    match result {
+                        Ok(stream) => {
+                            match self.accept_client(stream).await {
+                                Ok(conn) => {
+                                    if let Some(mut old) = client.take() {
+                                        let _ = write_frame_async(
+                                            &mut old.writer,
+                                            &S2C::Kicked { reason: "another client connected".to_string() },
+                                        ).await;
+                                        waiting.push_back(kick_to_waiting(old));
+                                    }
+                                    client = Some(conn);
+                                    dirty = false;
+                                }
+                                Err(e) => {
+                                    warn!("client handshake failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("accept error: {e}");
                         }
                     }
                 }

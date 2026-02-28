@@ -138,8 +138,11 @@ async fn run_session(
 
     let result: Result<()> = async {
         loop {
+            // biased; ensures input is always forwarded before rendering output
             tokio::select! {
-                // Local stdin → send to server
+                biased;
+
+                // Local stdin → send to server (highest priority)
                 Some(data) = stdin_rx.recv() => {
                     let result = detach_filter.feed(&data);
                     if !result.forward.is_empty() {
@@ -156,7 +159,13 @@ async fn run_session(
                     }
                 }
 
-                // Server messages
+                // Terminal resize
+                _ = sigwinch.recv() => {
+                    let (cols, rows) = crossterm::terminal::size()?;
+                    write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
+                }
+
+                // Server messages (lowest priority — render after input is handled)
                 msg = async {
                     match server_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -170,11 +179,9 @@ async fn run_session(
                         Some(S2C::ScreenData { data }) => {
                             stdout.write_all(b"\x1b[2J\x1b[H")?;
                             stdout.write_all(&data)?;
-                            stdout.flush()?;
                         }
                         Some(S2C::ScreenDiff { data }) => {
                             stdout.write_all(&data)?;
-                            stdout.flush()?;
                         }
                         Some(S2C::SetKkpMode { flags }) => {
                             if flags > 0 {
@@ -182,11 +189,9 @@ async fn run_session(
                                     write!(stdout, "\x1b[<u")?;
                                 }
                                 write!(stdout, "\x1b[>{flags}u")?;
-                                stdout.flush()?;
                                 local_kkp_active = true;
                             } else if local_kkp_active {
                                 write!(stdout, "\x1b[<u")?;
-                                stdout.flush()?;
                                 local_kkp_active = false;
                             }
                         }
@@ -198,11 +203,9 @@ async fn run_session(
                                 write!(stdout, "\x1b[?{mode}l")?;
                                 local_dec_modes.remove(&mode);
                             }
-                            stdout.flush()?;
                         }
                         Some(S2C::Clipboard { params, data }) => {
                             write!(stdout, "\x1b]52;{params};{data}\x07")?;
-                            stdout.flush()?;
                         }
                         Some(S2C::Kicked { reason }) => {
                             info!("kicked: {reason}");
@@ -217,12 +220,57 @@ async fn run_session(
                             break;
                         }
                     }
-                }
-
-                // Terminal resize
-                _ = sigwinch.recv() => {
-                    let (cols, rows) = crossterm::terminal::size()?;
-                    write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
+                    // Drain queued server messages before flushing so
+                    // multiple updates (e.g. DEC mode + diff) are written
+                    // to the terminal in a single flush.
+                    while let Some(rx) = server_rx.as_mut() {
+                        match rx.try_recv() {
+                            Ok(S2C::Snapshot(snapshot)) => {
+                                render::render_snapshot(&mut stdout, &snapshot)?;
+                            }
+                            Ok(S2C::ScreenData { data }) => {
+                                stdout.write_all(b"\x1b[2J\x1b[H")?;
+                                stdout.write_all(&data)?;
+                            }
+                            Ok(S2C::ScreenDiff { data }) => {
+                                stdout.write_all(&data)?;
+                            }
+                            Ok(S2C::SetKkpMode { flags }) => {
+                                if flags > 0 {
+                                    if local_kkp_active {
+                                        write!(stdout, "\x1b[<u")?;
+                                    }
+                                    write!(stdout, "\x1b[>{flags}u")?;
+                                    local_kkp_active = true;
+                                } else if local_kkp_active {
+                                    write!(stdout, "\x1b[<u")?;
+                                    local_kkp_active = false;
+                                }
+                            }
+                            Ok(S2C::SetDecMode { mode, enabled }) => {
+                                if enabled {
+                                    write!(stdout, "\x1b[?{mode}h")?;
+                                    local_dec_modes.insert(mode);
+                                } else {
+                                    write!(stdout, "\x1b[?{mode}l")?;
+                                    local_dec_modes.remove(&mode);
+                                }
+                            }
+                            Ok(S2C::Clipboard { params, data }) => {
+                                write!(stdout, "\x1b]52;{params};{data}\x07")?;
+                            }
+                            Ok(S2C::Kicked { reason }) => {
+                                info!("kicked: {reason}");
+                                exit_reason = ExitReason::Kicked(reason);
+                                stdout.flush()?;
+                                break;
+                            }
+                            Ok(S2C::Pong { .. }) => {}
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    stdout.flush()?;
                 }
             }
         }
