@@ -199,20 +199,23 @@ impl Session {
                     }
                 }
 
-                // ── Accept new client (kick existing if any) ─────────
+                // ── Accept new client (kick existing only after handshake) ──
                 result = self.listener.accept() => {
                     match result {
                         Ok(stream) => {
-                            // Kick existing client if any
-                            if let Some(mut old) = client.take() {
-                                let _ = write_frame_async(
-                                    &mut old.writer,
-                                    &S2C::Kicked { reason: "another client connected".to_string() },
-                                ).await;
-                                waiting.push_back(kick_to_waiting(old));
-                            }
+                            // Complete handshake BEFORE kicking, so that
+                            // probe connections (e.g. --list liveness check)
+                            // that never send Hello don't disrupt the
+                            // active client.
                             match self.accept_client(stream).await {
                                 Ok(conn) => {
+                                    if let Some(mut old) = client.take() {
+                                        let _ = write_frame_async(
+                                            &mut old.writer,
+                                            &S2C::Kicked { reason: "another client connected".to_string() },
+                                        ).await;
+                                        waiting.push_back(kick_to_waiting(old));
+                                    }
                                     client = Some(conn);
                                     dirty = false;
                                 }

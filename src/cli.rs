@@ -15,7 +15,7 @@ pub struct Cli {
     pub kill: Option<String>,
 
     /// List active sessions
-    #[arg(long)]
+    #[arg(long, alias = "ls")]
     pub list: bool,
 
     /// Program and arguments to run instead of $SHELL
