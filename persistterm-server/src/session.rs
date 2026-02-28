@@ -232,6 +232,10 @@ impl Session {
                                 drop(client.take());
                             }
                         }
+                        Some(C2S::KillSession) => {
+                            info!("client requested session kill");
+                            return Ok(());
+                        }
                         Some(C2S::RequestSnapshot) => {
                             let conn = client.as_mut().unwrap();
                             let data = self.terminal.screen_formatted();

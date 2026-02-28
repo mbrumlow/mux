@@ -17,6 +17,7 @@ pub enum C2S {
     Resize { width: u16, height: u16 },
     Ping { t: u64 },
     RequestSnapshot,
+    KillSession,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

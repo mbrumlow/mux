@@ -1,15 +1,18 @@
 const PREFIX_RAW: u8 = 0x1C; // Ctrl+backslash as raw byte
 const DETACH_RAW: u8 = b'd';
+const KILL_RAW: u8 = b'k';
 const ESC: u8 = 0x1b;
 const MAX_SEQ_LEN: usize = 64;
 
 // KKP: backslash is keycode 92, Ctrl modifier param is 5 (1 + 4)
 const KKP_BACKSLASH: u32 = 92;
 const KKP_D: u32 = 100;
+const KKP_K: u32 = 107;
 
 pub struct FilterResult {
     pub forward: Vec<u8>,
     pub detach: bool,
+    pub kill: bool,
 }
 
 enum State {
@@ -49,6 +52,10 @@ fn is_ctrl_backslash(keycode: u32, modifiers: u32) -> bool {
 
 fn is_plain_d(keycode: u32, modifiers: u32) -> bool {
     keycode == KKP_D && modifiers == 1
+}
+
+fn is_plain_k(keycode: u32, modifiers: u32) -> bool {
+    keycode == KKP_K && modifiers == 1
 }
 
 /// True for bytes that are CSI parameter characters (digits, ; :)
@@ -149,6 +156,14 @@ impl DetachFilter {
                         return FilterResult {
                             forward,
                             detach: true,
+                            kill: false,
+                        };
+                    } else if b == KILL_RAW {
+                        self.state = State::Normal;
+                        return FilterResult {
+                            forward,
+                            detach: false,
+                            kill: true,
                         };
                     } else if b == PREFIX_RAW {
                         // Raw escape: forward one literal 0x1C
@@ -191,6 +206,15 @@ impl DetachFilter {
                                 return FilterResult {
                                     forward,
                                     detach: true,
+                                    kill: false,
+                                };
+                            } else if is_plain_k(kc, mods) {
+                                self.seq_buf.clear();
+                                self.state = State::Normal;
+                                return FilterResult {
+                                    forward,
+                                    detach: false,
+                                    kill: true,
                                 };
                             } else if is_ctrl_backslash(kc, mods) {
                                 // KKP escape: forward one KKP Ctrl+\ sequence
@@ -221,6 +245,7 @@ impl DetachFilter {
         FilterResult {
             forward,
             detach: false,
+            kill: false,
         }
     }
 }
@@ -418,5 +443,82 @@ mod tests {
         // \x1b[65;1u is KKP for 'A' (keycode 65), should pass through
         assert_eq!(r.forward, b"abc\x1b[65;1udef");
         assert!(!r.detach);
+    }
+
+    // ── Kill (C-\ k) tests ──────────────────────────────────────
+
+    #[test]
+    fn raw_kill() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[PREFIX_RAW, KILL_RAW]);
+        assert!(r.forward.is_empty());
+        assert!(!r.detach);
+        assert!(r.kill);
+    }
+
+    #[test]
+    fn raw_kill_mid_chunk() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[b'a', b'b', PREFIX_RAW, KILL_RAW, b'c']);
+        assert_eq!(r.forward, b"ab");
+        assert!(!r.detach);
+        assert!(r.kill);
+    }
+
+    // 'k' in KKP: ESC [ 107 ; 1 u
+    const KKP_K_KEY: &[u8] = b"\x1b[107;1u";
+    // 'k' in KKP with no modifier field: ESC [ 107 u
+    const KKP_K_BARE: &[u8] = b"\x1b[107u";
+
+    #[test]
+    fn kkp_kill() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.extend_from_slice(KKP_K_KEY);
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(!r.detach);
+        assert!(r.kill);
+    }
+
+    #[test]
+    fn kkp_kill_bare_k() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.extend_from_slice(KKP_K_BARE);
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(!r.detach);
+        assert!(r.kill);
+    }
+
+    #[test]
+    fn kkp_kill_raw_k_after_kkp_prefix() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.push(b'k');
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(!r.detach);
+        assert!(r.kill);
+    }
+
+    #[test]
+    fn raw_detach_not_kill() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[PREFIX_RAW, DETACH_RAW]);
+        assert!(r.detach);
+        assert!(!r.kill);
+    }
+
+    #[test]
+    fn raw_kill_not_detach() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[PREFIX_RAW, KILL_RAW]);
+        assert!(!r.detach);
+        assert!(r.kill);
     }
 }

@@ -17,13 +17,36 @@ use persistterm_proto::{C2S, ClientCapabilities, S2C};
 enum ExitReason {
     Detached,
     Kicked(String),
+    Killed,
     ServerDisconnected,
 }
 
-pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
-    // Enable raw mode
-    let _raw = input::RawInput::enable()?;
+/// Clean up KKP and DEC modes on the local terminal.
+fn cleanup_terminal_modes(
+    stdout: &mut std::io::Stdout,
+    local_kkp_active: &mut bool,
+    local_dec_modes: &mut std::collections::HashSet<u16>,
+) {
+    if *local_kkp_active {
+        let _ = write!(stdout, "\x1b[<u");
+        let _ = stdout.flush();
+        *local_kkp_active = false;
+    }
+    for mode in local_dec_modes.iter() {
+        let _ = write!(stdout, "\x1b[?{mode}l");
+    }
+    if !local_dec_modes.is_empty() {
+        let _ = stdout.flush();
+        local_dec_modes.clear();
+    }
+}
 
+/// Run a single connection session. Returns the exit reason.
+async fn run_session(
+    sock_path: &Path,
+    session_name: &str,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<ExitReason> {
     // Get terminal size
     let (cols, rows) = crossterm::terminal::size()?;
 
@@ -70,10 +93,6 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
     )
     .await?;
 
-    // Spawn stdin reader
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
-    input::spawn_stdin_reader(stdin_tx);
-
     // Spawn task to read server messages
     let (server_tx, mut server_rx) = mpsc::channel::<S2C>(64);
     tokio::spawn(async move {
@@ -100,12 +119,10 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
 
     let mut detach_filter = detach::DetachFilter::new();
     let mut stdout = std::io::stdout();
-    // Track whether we've pushed a KKP mode on the local terminal
     let mut local_kkp_active = false;
-    // Track which DEC private modes are active on the local terminal
     let mut local_dec_modes = std::collections::HashSet::<u16>::new();
 
-    let mut exit_reason = None;
+    let mut exit_reason = ExitReason::ServerDisconnected;
 
     let result: Result<()> = async {
         loop {
@@ -116,8 +133,13 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                     if !result.forward.is_empty() {
                         write_frame_async(&mut writer, &C2S::RawInput { data: result.forward }).await?;
                     }
+                    if result.kill {
+                        write_frame_async(&mut writer, &C2S::KillSession).await?;
+                        exit_reason = ExitReason::Killed;
+                        break;
+                    }
                     if result.detach {
-                        exit_reason = Some(ExitReason::Detached);
+                        exit_reason = ExitReason::Detached;
                         break;
                     }
                 }
@@ -129,19 +151,16 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                             render::render_snapshot(&mut stdout, &snapshot)?;
                         }
                         Some(S2C::ScreenData { data }) => {
-                            // Full screen: clear + home, then write ANSI data
                             stdout.write_all(b"\x1b[2J\x1b[H")?;
                             stdout.write_all(&data)?;
                             stdout.flush()?;
                         }
                         Some(S2C::ScreenDiff { data }) => {
-                            // Delta update: write diff directly
                             stdout.write_all(&data)?;
                             stdout.flush()?;
                         }
                         Some(S2C::SetKkpMode { flags }) => {
                             if flags > 0 {
-                                // Pop existing mode if any, then push new one
                                 if local_kkp_active {
                                     write!(stdout, "\x1b[<u")?;
                                 }
@@ -170,14 +189,14 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                         }
                         Some(S2C::Kicked { reason }) => {
                             info!("kicked: {reason}");
-                            exit_reason = Some(ExitReason::Kicked(reason));
+                            exit_reason = ExitReason::Kicked(reason);
                             break;
                         }
                         Some(S2C::Pong { .. }) => {}
                         Some(_) => {}
                         None => {
                             info!("server disconnected");
-                            exit_reason = Some(ExitReason::ServerDisconnected);
+                            exit_reason = ExitReason::ServerDisconnected;
                             break;
                         }
                     }
@@ -193,18 +212,64 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
         Ok(())
     }.await;
 
-    // Clean up KKP on local terminal before exit
-    if local_kkp_active {
-        let _ = write!(stdout, "\x1b[<u");
-        let _ = stdout.flush();
+    // Clean up terminal modes from this session
+    cleanup_terminal_modes(&mut stdout, &mut local_kkp_active, &mut local_dec_modes);
+
+    result?;
+    Ok(exit_reason)
+}
+
+/// Wait for user input on the kicked overlay. Returns true to reconnect, false to exit.
+async fn wait_for_overlay_input(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> bool {
+    loop {
+        if let Some(data) = stdin_rx.recv().await {
+            for &b in &data {
+                match b {
+                    // Space or Enter → reconnect
+                    0x20 | 0x0d | 0x0a => return true,
+                    // 'q' or Esc → exit
+                    b'q' | 0x1b => return false,
+                    _ => {}
+                }
+            }
+        } else {
+            // stdin closed
+            return false;
+        }
     }
-    // Clean up all DEC private modes on local terminal before exit
-    for mode in &local_dec_modes {
-        let _ = write!(stdout, "\x1b[?{mode}l");
-    }
-    if !local_dec_modes.is_empty() {
-        let _ = stdout.flush();
-    }
+}
+
+pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
+    // Enable raw mode
+    let _raw = input::RawInput::enable()?;
+
+    // Spawn stdin reader (shared across reconnections)
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    input::spawn_stdin_reader(stdin_tx);
+
+    let result = loop {
+        match run_session(sock_path, session_name, &mut stdin_rx).await {
+            Ok(ExitReason::Kicked(reason)) => {
+                // Show overlay and wait for user decision
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let mut stdout = std::io::stdout();
+                let _ = render::render_kicked_overlay(&mut stdout, cols, rows);
+
+                if wait_for_overlay_input(&mut stdin_rx).await {
+                    // User chose to reconnect — loop back
+                    info!("reclaiming session after kick");
+                    continue;
+                } else {
+                    // User chose to exit
+                    break Ok(Some(ExitReason::Kicked(reason)));
+                }
+            }
+            Ok(ExitReason::Detached) => break Ok(Some(ExitReason::Detached)),
+            Ok(ExitReason::Killed) => break Ok(Some(ExitReason::Killed)),
+            Ok(ExitReason::ServerDisconnected) => break Ok(Some(ExitReason::ServerDisconnected)),
+            Err(e) => break Err(e),
+        }
+    };
 
     // Ensure terminal is cleaned up on exit
     drop(_raw);
@@ -215,18 +280,22 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
     let _ = stdout.flush();
 
     // Print exit reason to stderr (after terminal is restored)
-    match exit_reason {
-        Some(ExitReason::Detached) => {
+    match &result {
+        Ok(Some(ExitReason::Detached)) => {
             eprintln!("mux: detached from session '{session_name}'");
         }
-        Some(ExitReason::Kicked(reason)) => {
+        Ok(Some(ExitReason::Kicked(reason))) => {
             eprintln!("mux: kicked — {reason}");
         }
-        Some(ExitReason::ServerDisconnected) => {
+        Ok(Some(ExitReason::Killed)) => {
+            eprintln!("mux: killed session '{session_name}'");
+        }
+        Ok(Some(ExitReason::ServerDisconnected)) => {
             eprintln!("mux: server disconnected");
         }
-        None => {}
+        Ok(None) => {}
+        Err(_) => {}
     }
 
-    result
+    result.map(|_| ())
 }
