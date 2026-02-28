@@ -89,7 +89,8 @@ pub fn attach(name: &str, program: &[String]) -> Result<()> {
     rt.block_on(persistterm_client::run(&sock, name))
 }
 
-/// Get the PID of the peer process via SO_PEERCRED.
+/// Get the PID of the peer process via socket credentials.
+#[cfg(target_os = "linux")]
 fn get_peer_pid(stream: &UnixStream) -> Result<i32> {
     use std::os::unix::io::AsRawFd;
 
@@ -115,4 +116,33 @@ fn get_peer_pid(stream: &UnixStream) -> Result<i32> {
     }
 
     Ok(cred.pid)
+}
+
+/// Get the PID of the peer process via LOCAL_PEERPID.
+#[cfg(target_os = "macos")]
+fn get_peer_pid(stream: &UnixStream) -> Result<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret != 0 {
+        anyhow::bail!(
+            "getsockopt LOCAL_PEERPID failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok(pid)
 }
