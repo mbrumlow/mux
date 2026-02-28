@@ -19,7 +19,7 @@ Sessions survive disconnects. Reconnect and pick up exactly where you left off. 
 Add as a flake input:
 
 ```nix
-inputs.mux.url = "github:USERNAME/mux";
+inputs.mux.url = "github:mbrumlow/mux";
 
 # Direct package reference
 environment.systemPackages = [ inputs.mux.packages.${system}.default ];
@@ -51,14 +51,15 @@ mux work
 # Create a session running a specific program
 mux work -- emacs -nw
 
-# Kill and recreate a session
-mux -k work
+# Restart a session (kill existing, then create and attach)
+mux -r work
+mux work -r
 
 # List active sessions
-mux list
+mux --list
 
 # Kill a session
-mux kill work
+mux --kill work
 ```
 
 Detach from a session with `Ctrl+\ d`.

@@ -6,9 +6,17 @@ pub struct Cli {
     /// Session name to attach to or create
     pub name: Option<String>,
 
-    /// Kill existing session with this name first, then create and attach
-    #[arg(short = 'k', requires = "name")]
-    pub kill: bool,
+    /// Restart: kill existing session, then create and attach
+    #[arg(short = 'r', requires = "name")]
+    pub restart: bool,
+
+    /// Kill a session
+    #[arg(long, value_name = "SESSION")]
+    pub kill: Option<String>,
+
+    /// List active sessions
+    #[arg(long)]
+    pub list: bool,
 
     /// Program and arguments to run instead of $SHELL
     #[arg(last = true)]
@@ -20,11 +28,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// List active sessions
-    #[command(alias = "ls")]
-    List,
-    /// Kill a session
-    Kill { name: String },
     /// Internal: run server (used for daemonization)
     #[command(hide = true)]
     Server {

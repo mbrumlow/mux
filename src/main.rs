@@ -26,8 +26,9 @@ fn main() -> Result<()> {
 
             daemon::run_server(session, *rows, *cols, program)
         }
-        Some(Commands::List) => session_mgmt::list_sessions(),
-        Some(Commands::Kill { name }) => {
+        None if cli.list => session_mgmt::list_sessions(),
+        None if cli.kill.is_some() => {
+            let name = cli.kill.as_ref().unwrap();
             paths::validate_session_name(name)?;
             session_mgmt::kill_session(name)
         }
@@ -36,15 +37,15 @@ fn main() -> Result<()> {
                 Some(n) => n.clone(),
                 None => {
                     eprintln!("Usage: mux <session-name>");
-                    eprintln!("       mux list");
-                    eprintln!("       mux kill <name>");
+                    eprintln!("       mux --list");
+                    eprintln!("       mux --kill <session>");
                     std::process::exit(1);
                 }
             };
 
             paths::validate_session_name(&name)?;
 
-            if cli.kill {
+            if cli.restart {
                 let _ = session_mgmt::kill_session(&name);
             }
 
