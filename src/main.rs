@@ -35,12 +35,7 @@ fn main() -> Result<()> {
         None => {
             let name = match &cli.name {
                 Some(n) => n.clone(),
-                None => {
-                    eprintln!("Usage: mux <session-name>");
-                    eprintln!("       mux --list");
-                    eprintln!("       mux --kill <session>");
-                    std::process::exit(1);
-                }
+                None => "default".to_string(),
             };
 
             paths::validate_session_name(&name)?;
