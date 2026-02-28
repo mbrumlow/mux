@@ -32,4 +32,5 @@ pub enum S2C {
     Clipboard { params: String, data: String },
     ScreenData { data: Vec<u8> },
     ScreenDiff { data: Vec<u8> },
+    SessionAvailable,
 }

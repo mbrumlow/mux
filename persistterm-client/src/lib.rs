@@ -41,12 +41,13 @@ fn cleanup_terminal_modes(
     }
 }
 
-/// Run a single connection session. Returns the exit reason.
+/// Run a single connection session. Returns the exit reason and optionally
+/// the server message receiver (kept alive when kicked, for auto-reclaim).
 async fn run_session(
     sock_path: &Path,
     session_name: &str,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
-) -> Result<ExitReason> {
+) -> Result<(ExitReason, Option<mpsc::Receiver<S2C>>)> {
     // Get terminal size
     let (cols, rows) = crossterm::terminal::size()?;
 
@@ -94,7 +95,7 @@ async fn run_session(
     .await?;
 
     // Spawn task to read server messages
-    let (server_tx, mut server_rx) = mpsc::channel::<S2C>(64);
+    let (server_tx, server_rx) = mpsc::channel::<S2C>(64);
     tokio::spawn(async move {
         loop {
             match read_frame_async::<_, S2C>(&mut reader).await {
@@ -123,6 +124,7 @@ async fn run_session(
     let mut local_dec_modes = std::collections::HashSet::<u16>::new();
 
     let mut exit_reason = ExitReason::ServerDisconnected;
+    let mut server_rx = Some(server_rx);
 
     let result: Result<()> = async {
         loop {
@@ -145,7 +147,12 @@ async fn run_session(
                 }
 
                 // Server messages
-                msg = server_rx.recv() => {
+                msg = async {
+                    match server_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     match msg {
                         Some(S2C::Snapshot(snapshot)) => {
                             render::render_snapshot(&mut stdout, &snapshot)?;
@@ -215,26 +222,62 @@ async fn run_session(
     // Clean up terminal modes from this session
     cleanup_terminal_modes(&mut stdout, &mut local_kkp_active, &mut local_dec_modes);
 
+    // Take server_rx for Kicked case (keep socket alive for auto-reclaim)
+    let kept_rx = if matches!(exit_reason, ExitReason::Kicked(_)) {
+        server_rx.take()
+    } else {
+        None
+    };
+
     result?;
-    Ok(exit_reason)
+    Ok((exit_reason, kept_rx))
 }
 
-/// Wait for user input on the kicked overlay. Returns true to reconnect, false to exit.
-async fn wait_for_overlay_input(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> bool {
+/// Action from the kicked overlay.
+enum OverlayAction {
+    Reconnect,
+    Exit,
+}
+
+/// Wait for overlay input or server notification (auto-reclaim).
+async fn wait_for_overlay_action(
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    server_rx: Option<&mut mpsc::Receiver<S2C>>,
+) -> OverlayAction {
+    let mut server_rx = server_rx;
     loop {
-        if let Some(data) = stdin_rx.recv().await {
-            for &b in &data {
-                match b {
-                    // Space or Enter → reconnect
-                    0x20 | 0x0d | 0x0a => return true,
-                    // 'q' or Esc → exit
-                    b'q' | 0x1b => return false,
-                    _ => {}
+        tokio::select! {
+            data = stdin_rx.recv() => {
+                if let Some(data) = data {
+                    for &b in &data {
+                        match b {
+                            // Space or Enter → reconnect
+                            0x20 | 0x0d | 0x0a => return OverlayAction::Reconnect,
+                            // 'q' or Esc → exit
+                            b'q' | 0x1b => return OverlayAction::Exit,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    // stdin closed
+                    return OverlayAction::Exit;
                 }
             }
-        } else {
-            // stdin closed
-            return false;
+            msg = async {
+                match server_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match msg {
+                    Some(S2C::SessionAvailable) => return OverlayAction::Reconnect,
+                    Some(_) => {} // ignore other messages
+                    None => {
+                        // Server gone — disable this branch
+                        server_rx = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -249,24 +292,30 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
 
     let result = loop {
         match run_session(sock_path, session_name, &mut stdin_rx).await {
-            Ok(ExitReason::Kicked(reason)) => {
-                // Show overlay and wait for user decision
+            Ok((ExitReason::Kicked(reason), mut server_rx)) => {
+                // Show overlay and wait for user decision or auto-reclaim
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let mut stdout = std::io::stdout();
                 let _ = render::render_kicked_overlay(&mut stdout, cols, rows);
 
-                if wait_for_overlay_input(&mut stdin_rx).await {
-                    // User chose to reconnect — loop back
-                    info!("reclaiming session after kick");
-                    continue;
-                } else {
-                    // User chose to exit
-                    break Ok(Some(ExitReason::Kicked(reason)));
+                let action = wait_for_overlay_action(
+                    &mut stdin_rx,
+                    server_rx.as_mut(),
+                ).await;
+
+                match action {
+                    OverlayAction::Reconnect => {
+                        info!("reclaiming session after kick");
+                        continue;
+                    }
+                    OverlayAction::Exit => {
+                        break Ok(Some(ExitReason::Kicked(reason)));
+                    }
                 }
             }
-            Ok(ExitReason::Detached) => break Ok(Some(ExitReason::Detached)),
-            Ok(ExitReason::Killed) => break Ok(Some(ExitReason::Killed)),
-            Ok(ExitReason::ServerDisconnected) => break Ok(Some(ExitReason::ServerDisconnected)),
+            Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
+            Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
+            Ok((ExitReason::ServerDisconnected, _)) => break Ok(Some(ExitReason::ServerDisconnected)),
             Err(e) => break Err(e),
         }
     };

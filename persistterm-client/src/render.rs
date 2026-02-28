@@ -65,7 +65,9 @@ pub fn render_kicked_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std
     let lines: &[&str] = &[
         "Session moved to another client.",
         "",
-        "Press SPACE or ENTER to reclaim.",
+        "Waiting to reclaim automatically...",
+        "",
+        "Press SPACE or ENTER to reclaim now.",
         "Press q or ESC to exit.",
     ];
 
@@ -78,7 +80,10 @@ pub fn render_kicked_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std
         if i == 0 {
             // Bold for the header
             write!(out, "\x1b[1m{line}\x1b[0m")?;
-        } else if i >= 2 {
+        } else if i == 2 {
+            // Dim for the "waiting" status line
+            write!(out, "\x1b[2m{line}\x1b[0m")?;
+        } else if i >= 4 {
             // Reverse for the key instructions
             write!(out, "\x1b[7m{line}\x1b[0m")?;
         } else {

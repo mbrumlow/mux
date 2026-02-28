@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,6 +21,41 @@ struct ClientConn {
     writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
     msg_rx: mpsc::Receiver<C2S>,
     _read_task: tokio::task::JoinHandle<()>,
+}
+
+/// A kicked client that is still connected and waiting to reclaim.
+struct WaitingClient {
+    writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    dead: Arc<AtomicBool>,
+}
+
+/// Convert a kicked ClientConn into a WaitingClient, keeping the socket alive.
+fn kick_to_waiting(conn: ClientConn) -> WaitingClient {
+    let ClientConn { writer, mut msg_rx, _read_task } = conn;
+    let dead = Arc::new(AtomicBool::new(false));
+    let dead_clone = dead.clone();
+    tokio::spawn(async move {
+        // Drain incoming messages to keep the reader task alive
+        while msg_rx.recv().await.is_some() {}
+        // Channel closed — socket is gone
+        dead_clone.store(true, Ordering::Relaxed);
+    });
+    WaitingClient { writer, dead }
+}
+
+/// Notify the most recently kicked waiting client that the session is available.
+async fn notify_next_waiting(waiting: &mut VecDeque<WaitingClient>) {
+    while let Some(mut w) = waiting.pop_back() {
+        if w.dead.load(Ordering::Relaxed) {
+            continue;
+        }
+        if let Err(e) = write_frame_async(&mut w.writer, &S2C::SessionAvailable).await {
+            warn!("failed to notify waiting client: {e}");
+            continue;
+        }
+        info!("notified waiting client to reclaim session");
+        return;
+    }
 }
 
 pub struct Session {
@@ -60,6 +98,7 @@ impl Session {
 
     pub async fn run(&mut self) -> Result<()> {
         let mut client: Option<ClientConn> = None;
+        let mut waiting: VecDeque<WaitingClient> = VecDeque::new();
         let mut dirty = false;
         let mut interval = tokio::time::interval(Duration::from_millis(16));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -73,6 +112,7 @@ impl Session {
                 // ── SIGTERM → clean shutdown ──────────────────────────
                 _ = sigterm.recv() => {
                     info!("received SIGTERM, shutting down");
+                    waiting.clear();
                     return Ok(());
                 }
                 // ── PTY output (always active) ──────────────────────────
@@ -101,6 +141,7 @@ impl Session {
                                     ).await {
                                         warn!("failed to send KKP mode, dropping client: {e}");
                                         drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
                                     }
                                 }
                             }
@@ -115,6 +156,7 @@ impl Session {
                                     ).await {
                                         warn!("failed to send DEC mode, dropping client: {e}");
                                         drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
                                         break;
                                     }
                                 }
@@ -137,6 +179,7 @@ impl Session {
                                                     ).await {
                                                         warn!("failed to send clipboard, dropping client: {e}");
                                                         drop(client.take());
+                                                        notify_next_waiting(&mut waiting).await;
                                                         break;
                                                     }
                                                 }
@@ -150,6 +193,7 @@ impl Session {
                         }
                         None => {
                             info!("shell exited, ending session");
+                            waiting.clear();
                             return Ok(());
                         }
                     }
@@ -165,6 +209,7 @@ impl Session {
                                     &mut old.writer,
                                     &S2C::Kicked { reason: "another client connected".to_string() },
                                 ).await;
+                                waiting.push_back(kick_to_waiting(old));
                             }
                             match self.accept_client(stream).await {
                                 Ok(conn) => {
@@ -189,6 +234,7 @@ impl Session {
                         if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
                             warn!("failed to send screen diff, dropping client: {e}");
                             drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
                         }
                     }
                     dirty = false;
@@ -220,6 +266,7 @@ impl Session {
                             if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenData { data }).await {
                                 warn!("failed to send resize screen data, dropping client: {e}");
                                 drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
                             } else {
                                 self.terminal.reset_prev_screen();
                                 dirty = false;
@@ -230,10 +277,12 @@ impl Session {
                             if let Err(e) = write_frame_async(&mut conn.writer, &S2C::Pong { t }).await {
                                 warn!("failed to send pong, dropping client: {e}");
                                 drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
                             }
                         }
                         Some(C2S::KillSession) => {
                             info!("client requested session kill");
+                            waiting.clear();
                             return Ok(());
                         }
                         Some(C2S::RequestSnapshot) => {
@@ -242,6 +291,7 @@ impl Session {
                             if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenData { data }).await {
                                 warn!("failed to send snapshot, dropping client: {e}");
                                 drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
                             } else {
                                 self.terminal.reset_prev_screen();
                                 dirty = false;
@@ -251,6 +301,7 @@ impl Session {
                         None => {
                             info!("client disconnected");
                             drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
                         }
                     }
                 }
