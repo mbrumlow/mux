@@ -268,7 +268,14 @@ impl Terminal {
                 frame.line_seqnos.push(0);
             }
             self.prev_frame = Some(frame);
-            return Some(self.screen_formatted());
+            // Wrap full screen in synchronized update so the terminal renders
+            // the clear + repaint atomically (no flash).
+            let formatted = self.screen_formatted();
+            let mut out = Vec::with_capacity(formatted.len() + 32);
+            out.extend_from_slice(b"\x1b[?2026h");
+            out.extend_from_slice(&formatted);
+            out.extend_from_slice(b"\x1b[?2026l");
+            return Some(out);
         }
 
         // ── Scroll detection ──
@@ -445,6 +452,12 @@ impl Terminal {
         } else {
             Some(out)
         }
+    }
+
+    /// Invalidate the previous frame so the next `screen_diff()` returns a
+    /// full screen repaint. Used for periodic integrity refreshes.
+    pub fn invalidate_prev_frame(&mut self) {
+        self.prev_frame = None;
     }
 
     /// Reset the previous screen to the current state.

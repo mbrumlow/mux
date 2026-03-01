@@ -154,6 +154,13 @@ impl Session {
         // before force-rendering. Prevents hangs if the app never sends
         // the closing sequence.
         const MAX_SYNC_MS: u64 = 500;
+        // Periodic full-screen refresh interval. Repairs screen corruption
+        // caused by the outer terminal (e.g. kitty's clear_terminal action)
+        // manipulating its display behind mux's back.
+        const REFRESH_SECS: u64 = 2;
+        let mut refresh_interval = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
+        // Don't fire immediately on startup (client gets a full screen on connect).
+        refresh_interval.reset();
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -370,6 +377,19 @@ impl Session {
                     dirty = false;
                     dirty_since = None;
                     last_pty_at = None;
+                }
+
+                // ── Periodic full-screen refresh (repairs screen corruption) ──
+                _ = refresh_interval.tick(), if client.is_some() && !dirty => {
+                    self.terminal.invalidate_prev_frame();
+                    if let Some(data) = self.terminal.screen_diff() {
+                        let conn = client.as_mut().unwrap();
+                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                            warn!("failed to send refresh, dropping client: {e}");
+                            drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
+                        }
+                    }
                 }
 
                 // ── Accept new client (kick existing only after handshake) ──

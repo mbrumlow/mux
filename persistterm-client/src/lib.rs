@@ -157,6 +157,9 @@ async fn run_session(
                         exit_reason = ExitReason::Detached;
                         break;
                     }
+                    if result.refresh {
+                        write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
+                    }
                 }
 
                 // Terminal resize
@@ -177,8 +180,9 @@ async fn run_session(
                             render::render_snapshot(&mut stdout, &snapshot)?;
                         }
                         Some(S2C::ScreenData { data }) => {
-                            stdout.write_all(b"\x1b[2J\x1b[H")?;
+                            stdout.write_all(b"\x1b[?2026h\x1b[2J\x1b[H")?;
                             stdout.write_all(&data)?;
+                            stdout.write_all(b"\x1b[?2026l")?;
                         }
                         Some(S2C::ScreenDiff { data }) => {
                             stdout.write_all(&data)?;
@@ -234,8 +238,9 @@ async fn run_session(
                                 render::render_snapshot(&mut stdout, &snapshot)?;
                             }
                             Ok(S2C::ScreenData { data }) => {
-                                stdout.write_all(b"\x1b[2J\x1b[H")?;
+                                stdout.write_all(b"\x1b[?2026h\x1b[2J\x1b[H")?;
                                 stdout.write_all(&data)?;
+                                stdout.write_all(b"\x1b[?2026l")?;
                             }
                             Ok(S2C::ScreenDiff { data }) => {
                                 stdout.write_all(&data)?;
