@@ -76,7 +76,7 @@ async fn run_session(
         }
     };
 
-    // Set terminal title to HOSTNAME/session_name
+    // Set terminal title to HOSTNAME/session_name (save original title first)
     {
         let hostname = std::env::var("HOSTNAME")
                 .ok()
@@ -90,7 +90,8 @@ async fn run_session(
                 })
                 .unwrap_or_else(|| "unknown".to_string());
         let mut stdout = std::io::stdout();
-        let _ = write!(stdout, "\x1b]0;{hostname}/{session_name}\x07");
+        // Save current title on the XTERM title stack, then set our title
+        let _ = write!(stdout, "\x1b[22;0t\x1b]0;{hostname}/{session_name}\x07");
         let _ = stdout.flush();
     }
 
@@ -409,8 +410,9 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
     drop(_raw);
     let _ = crossterm::terminal::disable_raw_mode();
     let mut stdout = std::io::stdout();
-    // Pop any KKP modes we may have pushed, reset attributes, clear screen, show cursor
-    let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+    // Pop any KKP modes we may have pushed, reset attributes, clear screen, show cursor,
+    // and restore the original terminal title from the XTERM title stack
+    let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h\x1b[23;0t");
     let _ = stdout.flush();
 
     // Print exit reason to stderr (after terminal is restored)
