@@ -37,6 +37,7 @@ impl PtyHandle {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("MUX_SESSION", session_name);
+        cmd.env_remove("SSH_TTY");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
