@@ -77,7 +77,7 @@ pub fn kill_session(name: &str) -> Result<()> {
 pub fn attach(name: &str, program: &[String]) -> Result<()> {
     paths::validate_session_name(name)?;
 
-    daemon::ensure_server(name, program)?;
+    daemon::ensure_server(name, program, None)?;
 
     let sock = paths::socket_path(name);
 

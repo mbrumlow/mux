@@ -422,6 +422,37 @@ impl Session {
         }
     }
 
+    /// After resizing the PTY, drain output briefly so the child process
+    /// can re-render at the new size before we capture the screen.
+    async fn drain_pty_after_resize(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let mut got_data = false;
+
+        loop {
+            let timeout = if got_data {
+                // After receiving data, use a short quiescence timeout
+                (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline)
+            } else {
+                deadline
+            };
+
+            tokio::select! {
+                data = self.pty_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            self.terminal.process(&data);
+                            got_data = true;
+                        }
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep_until(timeout) => {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Perform client handshake and return a ClientConn on success.
     async fn accept_client(
         &mut self,
@@ -437,10 +468,15 @@ impl Session {
                       width = caps.width, height = caps.height, "client hello");
                 // Resize to client dimensions before sending initial screen data
                 if caps.width > 0 && caps.height > 0 {
+                    let size_changed = (caps.height, caps.width) != self.terminal.size();
                     if let Err(e) = self.pty.resize(caps.height, caps.width) {
                         error!("failed to resize PTY on hello: {e}");
                     }
                     self.terminal.resize(caps.height, caps.width);
+                    // If the size changed, give the child time to re-render
+                    if size_changed {
+                        self.drain_pty_after_resize().await;
+                    }
                 }
             }
             _ => {

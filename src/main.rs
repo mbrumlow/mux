@@ -26,9 +26,10 @@ fn main() -> Result<()> {
 
             daemon::run_server(session, *rows, *cols, program)
         }
-        Some(Commands::Bridge { session }) => {
+        Some(Commands::Bridge { session, cols, rows }) => {
             paths::validate_session_name(session)?;
-            daemon::run_bridge(session)
+            let initial_size = cols.zip(*rows);
+            daemon::run_bridge(session, initial_size)
         }
         None if cli.list => session_mgmt::list_sessions(),
         None if cli.kill.is_some() => {

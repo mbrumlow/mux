@@ -50,6 +50,10 @@ pub enum Commands {
     Bridge {
         #[arg(long)]
         session: String,
+        #[arg(long)]
+        cols: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
     },
 }
 

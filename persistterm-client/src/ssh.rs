@@ -131,7 +131,8 @@ pub async fn connect(
         .await
         .context("failed to open SSH session channel")?;
     let mux_bin = std::env::var("MUX_REMOTE_BIN").unwrap_or_else(|_| "mux".to_string());
-    let command = format!("{mux_bin} bridge --session {session_name}");
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let command = format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
     channel
         .exec(true, command)
         .await

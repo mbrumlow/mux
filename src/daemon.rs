@@ -34,7 +34,7 @@ fn lock_session(name: &str) -> Result<File> {
 /// Ensure a server is running for the given session name.
 /// If one is already alive, returns Ok immediately.
 /// If the socket is stale, removes it and starts a new server.
-pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
+pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
     // Hold an advisory lock to prevent two clients from racing
     let _lock = lock_session(name)?;
 
@@ -59,8 +59,10 @@ pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
 
     let log_file_err = log_file.try_clone().context("failed to clone log file")?;
 
-    // Query the current terminal size so the PTY starts at the right dimensions
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Use the provided size (from remote client) or query the local terminal
+    let (cols, rows) = initial_size.unwrap_or_else(|| {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    });
 
     // Re-exec ourselves as: mux server --session <name>
     let exe = std::env::current_exe().context("failed to get current exe")?;
@@ -109,10 +111,9 @@ fn try_connect_sync(path: &Path) -> bool {
 
 /// Bridge stdin/stdout to a session socket (used by SSH remote).
 /// This is a pure byte relay — it does not parse protocol messages.
-pub fn run_bridge(session: &str) -> Result<()> {
-    // Ensure server is running (uses default 80x24 since we don't know the
-    // client's terminal size yet; the client sends Resize immediately).
-    ensure_server(session, &[])?;
+pub fn run_bridge(session: &str, initial_size: Option<(u16, u16)>) -> Result<()> {
+    // Ensure server is running with the client's terminal size (passed via CLI args).
+    ensure_server(session, &[], initial_size)?;
 
     let sock = paths::socket_path(session);
 
