@@ -16,8 +16,6 @@ use tracing::{error, info};
 use persistterm_proto::codec::async_io::{read_frame_async, write_frame_async};
 use persistterm_proto::{C2S, ClientCapabilities, S2C};
 
-const MAX_RECONNECT_RETRIES: u32 = 30;
-
 /// Reason the client session ended.
 enum ExitReason {
     Detached,
@@ -384,7 +382,10 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
     let hostname = local_hostname();
 
     let result = loop {
-        let stream = net::connect(sock_path).await?;
+        let stream = match net::connect(sock_path).await {
+            Ok(s) => s,
+            Err(e) => break Err(e),
+        };
         let (reader, writer) = tokio::io::split(stream);
         match run_session(
             Box::new(reader),
@@ -434,33 +435,8 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
         }
     };
 
-    // Ensure terminal is cleaned up on exit
     drop(_raw);
-    let _ = crossterm::terminal::disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    // Pop any KKP modes we may have pushed, reset attributes, clear screen, show cursor,
-    // and restore the original terminal title from the XTERM title stack
-    let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h\x1b[23;0t");
-    let _ = stdout.flush();
-
-    // Print exit reason to stderr (after terminal is restored)
-    match &result {
-        Ok(Some(ExitReason::Detached)) => {
-            eprintln!("mux: detached from session '{session_name}'");
-        }
-        Ok(Some(ExitReason::Kicked(reason))) => {
-            eprintln!("mux: kicked — {reason}");
-        }
-        Ok(Some(ExitReason::Killed)) => {
-            eprintln!("mux: killed session '{session_name}'");
-        }
-        Ok(Some(ExitReason::SessionEnded)) | Ok(Some(ExitReason::ServerDisconnected)) => {
-            eprintln!("mux: server disconnected");
-        }
-        Ok(None) => {}
-        Err(_) => {}
-    }
-
+    cleanup_terminal(session_name, &result);
     result.map(|_| ())
 }
 
@@ -547,6 +523,12 @@ async fn show_reconnect_overlay(
 fn cleanup_terminal(session_name: &str, result: &Result<Option<ExitReason>>) {
     let _ = crossterm::terminal::disable_raw_mode();
     let mut stdout = std::io::stdout();
+    // Defensive: disable common DEC modes that break terminal usability
+    let _ = write!(stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"); // mouse tracking
+    let _ = write!(stdout, "\x1b[?2004l"); // bracketed paste
+    let _ = write!(stdout, "\x1b[?1049l"); // alternate screen buffer
+    let _ = write!(stdout, "\x1b[?2026l"); // synchronized update
+    // KKP pop, reset attrs, clear screen, cursor home, show cursor, restore title
     let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h\x1b[23;0t");
     let _ = stdout.flush();
 
@@ -584,7 +566,7 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
                 attempt = 0;
                 conn
             }
-            Err(e) if attempt < MAX_RECONNECT_RETRIES => {
+            Err(e) => {
                 attempt += 1;
                 info!("SSH connection failed (attempt {attempt}): {e}");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
@@ -592,7 +574,6 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
                     ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
                 }
             }
-            Err(e) => break Err(e),
         };
 
         let (reader, writer) = ssh_conn;
@@ -602,11 +583,7 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
             Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
             Ok((ExitReason::ServerDisconnected, _)) => {
-                // SSH dropped or remote bridge exited — try to reconnect
                 attempt += 1;
-                if attempt > MAX_RECONNECT_RETRIES {
-                    break Ok(Some(ExitReason::ServerDisconnected));
-                }
                 info!("server disconnected, attempting reconnect (attempt {attempt})");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
                     ReconnectAction::Retry => continue,
@@ -625,9 +602,6 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             }
             Err(e) => {
                 attempt += 1;
-                if attempt > MAX_RECONNECT_RETRIES {
-                    break Err(e);
-                }
                 info!("session error (attempt {attempt}): {e}");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
                     ReconnectAction::Retry => continue,
