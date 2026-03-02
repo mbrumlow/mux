@@ -89,6 +89,21 @@ pub fn attach(name: &str, program: &[String]) -> Result<()> {
     rt.block_on(persistterm_client::run(&sock, name))
 }
 
+/// Attach to a remote session over SSH.
+pub fn attach_remote(host: &str, session: &str) -> Result<()> {
+    let config = crate::config::Config::load();
+    let ssh_options = persistterm_client::ssh::SshOptions {
+        compression: config.ssh.compression,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(persistterm_client::run_remote(host, session, &ssh_options))
+}
+
 /// Get the PID of the peer process via socket credentials.
 #[cfg(target_os = "linux")]
 fn get_peer_pid(stream: &UnixStream) -> Result<i32> {

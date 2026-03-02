@@ -122,6 +122,88 @@ pub fn render_session_ended_overlay<W: Write>(out: &mut W, cols: u16, rows: u16)
     out.flush()
 }
 
+pub fn render_remote_kicked_overlay<W: Write>(
+    out: &mut W,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<()> {
+    // Clear screen, reset attributes, hide cursor
+    write!(out, "\x1b[0m\x1b[2J\x1b[?25l")?;
+
+    let lines: &[&str] = &[
+        "Session taken by another client.",
+        "",
+        "Press SPACE or ENTER to reclaim.",
+        "Press q or ESC to exit.",
+    ];
+
+    let start_row = rows.saturating_sub(lines.len() as u16) / 2 + 1;
+
+    for (i, line) in lines.iter().enumerate() {
+        let row = start_row + i as u16;
+        let col = cols.saturating_sub(line.len() as u16) / 2 + 1;
+        write!(out, "\x1b[{row};{col}H")?;
+        if i == 0 {
+            // Bold for the header
+            write!(out, "\x1b[1m{line}\x1b[0m")?;
+        } else if i >= 2 {
+            // Reverse for the key instructions
+            write!(out, "\x1b[7m{line}\x1b[0m")?;
+        } else {
+            write!(out, "{line}")?;
+        }
+    }
+
+    out.flush()
+}
+
+pub fn render_reconnect_overlay<W: Write>(
+    out: &mut W,
+    cols: u16,
+    rows: u16,
+    host: &str,
+    session: &str,
+    attempt: u32,
+    countdown: u32,
+) -> std::io::Result<()> {
+    // Clear screen, reset attributes, hide cursor
+    write!(out, "\x1b[0m\x1b[2J\x1b[?25l")?;
+
+    let header = format!("Connection to {host}/{session} lost.");
+    let status = format!("Reconnecting in {countdown}s... (attempt {attempt})");
+
+    let lines: &[&str] = &[
+        &header,
+        "",
+        &status,
+        "",
+        "Press ENTER to retry now.",
+        "Press q or ESC to exit.",
+    ];
+
+    let start_row = rows.saturating_sub(lines.len() as u16) / 2 + 1;
+
+    for (i, line) in lines.iter().enumerate() {
+        let row = start_row + i as u16;
+        let col = cols.saturating_sub(line.len() as u16) / 2 + 1;
+        write!(out, "\x1b[{row};{col}H")?;
+        if i == 0 {
+            // Bold for the header
+            write!(out, "\x1b[1m{line}\x1b[0m")?;
+        } else if i == 2 {
+            // Dim for the status line
+            write!(out, "\x1b[2m{line}\x1b[0m")?;
+        } else if i >= 4 {
+            // Reverse for key instructions
+            write!(out, "\x1b[7m{line}\x1b[0m")?;
+        } else {
+            write!(out, "{line}")?;
+        }
+    }
+
+    out.flush()
+}
+
 fn emit_sgr<W: Write>(out: &mut W, style: &CellStyle) -> std::io::Result<()> {
     // Reset then apply
     write!(out, "\x1b[0")?;

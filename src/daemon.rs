@@ -107,6 +107,40 @@ fn try_connect_sync(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// Bridge stdin/stdout to a session socket (used by SSH remote).
+/// This is a pure byte relay — it does not parse protocol messages.
+pub fn run_bridge(session: &str) -> Result<()> {
+    // Ensure server is running (uses default 80x24 since we don't know the
+    // client's terminal size yet; the client sends Resize immediately).
+    ensure_server(session, &[])?;
+
+    let sock = paths::socket_path(session);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&sock).await?;
+        let (mut sock_reader, mut sock_writer) = tokio::io::split(stream);
+
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+
+        tokio::select! {
+            r = tokio::io::copy(&mut stdin, &mut sock_writer) => {
+                r.context("bridge: stdin → socket copy failed")?;
+            }
+            r = tokio::io::copy(&mut sock_reader, &mut stdout) => {
+                r.context("bridge: socket → stdout copy failed")?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
 /// Run the server in the current process (called by `mux server --session <name>`).
 pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Result<()> {
     let sock = paths::socket_path(name);

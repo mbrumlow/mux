@@ -101,6 +101,8 @@ mod tests {
                 supports_kkp: false,
                 supports_truecolor: true,
                 term: "xterm-256color".to_string(),
+                width: 80,
+                height: 24,
             },
         };
         let mut buf = Vec::new();

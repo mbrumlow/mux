@@ -433,7 +433,15 @@ impl Session {
         let hello: C2S = read_frame_async(&mut reader).await?;
         match &hello {
             C2S::Hello { caps } => {
-                info!(term = %caps.term, kkp = caps.supports_kkp, "client hello");
+                info!(term = %caps.term, kkp = caps.supports_kkp,
+                      width = caps.width, height = caps.height, "client hello");
+                // Resize to client dimensions before sending initial screen data
+                if caps.width > 0 && caps.height > 0 {
+                    if let Err(e) = self.pty.resize(caps.height, caps.width) {
+                        error!("failed to resize PTY on hello: {e}");
+                    }
+                    self.terminal.resize(caps.height, caps.width);
+                }
             }
             _ => {
                 anyhow::bail!("expected Hello, got something else");
@@ -449,7 +457,7 @@ impl Session {
         )
         .await?;
 
-        // Send initial full screen data
+        // Send initial full screen data (at client's dimensions)
         let data = self.terminal.screen_formatted();
         write_frame_async(&mut writer, &S2C::ScreenData { data }).await?;
         self.terminal.reset_prev_screen();

@@ -52,6 +52,11 @@ pub fn log_path(name: &str) -> PathBuf {
     log_dir().join(format!("{name}.log"))
 }
 
+/// Log file path for a remote client session (host_session.log).
+pub fn client_log_path(host: &str, session: &str) -> PathBuf {
+    log_dir().join(format!("{host}_{session}.log"))
+}
+
 /// Create socket and log directories with 0o700 permissions.
 pub fn ensure_dirs() -> Result<()> {
     let mut builder = fs::DirBuilder::new();

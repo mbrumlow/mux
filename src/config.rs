@@ -4,12 +4,22 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 #[derive(Default, Deserialize)]
+pub struct SshConfig {
+    /// Enable zlib compression for SSH connections.
+    #[serde(default)]
+    pub compression: bool,
+}
+
+#[derive(Default, Deserialize)]
 pub struct Config {
     /// Default program to run (e.g. "emacs -nw"). Overridden by `-- <PROGRAM>` on CLI.
     pub program: Option<String>,
     /// Extra environment variables. Values can reference $MUX_SESSION and other env vars.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// SSH options for remote sessions.
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 impl Config {

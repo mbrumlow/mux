@@ -45,4 +45,25 @@ pub enum Commands {
         #[arg(last = true)]
         program: Vec<String>,
     },
+    /// Internal: bridge stdin/stdout to a session socket (used by SSH remote)
+    #[command(hide = true)]
+    Bridge {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+pub enum SessionTarget {
+    Local(String),
+    Remote { host: String, session: String },
+}
+
+pub fn parse_target(name: &str) -> SessionTarget {
+    match name.split_once('/') {
+        Some((host, session)) => SessionTarget::Remote {
+            host: host.to_string(),
+            session: session.to_string(),
+        },
+        None => SessionTarget::Local(name.to_string()),
+    }
 }
