@@ -28,6 +28,11 @@ pub fn list_sessions() -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("???");
 
+        // Skip agent symlinks (e.g. "mysession.agent.sock")
+        if name.ends_with(".agent") {
+            continue;
+        }
+
         if UnixStream::connect(&path).is_ok() {
             println!("{name}");
             found = true;
@@ -66,8 +71,11 @@ pub fn kill_session(name: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Clean up socket file
+    // Clean up socket, lock, and agent symlink
     let _ = std::fs::remove_file(&sock);
+    let lock_path = paths::socket_dir().join(format!("{name}.lock"));
+    let _ = std::fs::remove_file(lock_path);
+    paths::remove_agent_link(name);
 
     eprintln!("killed session '{name}'");
     Ok(())
@@ -77,7 +85,11 @@ pub fn kill_session(name: &str) -> Result<()> {
 pub fn attach(name: &str, program: &[String]) -> Result<()> {
     paths::validate_session_name(name)?;
 
-    daemon::ensure_server(name, program)?;
+    // Update SSH agent symlink so the PTY (or an existing session) can
+    // reach the caller's current SSH agent.
+    let _ = paths::update_agent_link(name);
+
+    daemon::ensure_server(name, program, None)?;
 
     let sock = paths::socket_path(name);
 
@@ -87,6 +99,21 @@ pub fn attach(name: &str, program: &[String]) -> Result<()> {
         .context("failed to build tokio runtime")?;
 
     rt.block_on(persistterm_client::run(&sock, name))
+}
+
+/// Attach to a remote session over SSH.
+pub fn attach_remote(host: &str, session: &str, program: &[String]) -> Result<()> {
+    let config = crate::config::Config::load();
+    let ssh_options = persistterm_client::ssh::SshOptions {
+        compression: config.ssh.compression,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(persistterm_client::run_remote(host, session, program, &ssh_options))
 }
 
 /// Get the PID of the peer process via socket credentials.

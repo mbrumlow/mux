@@ -2,11 +2,14 @@ pub mod detach;
 pub mod input;
 pub mod net;
 pub mod render;
+pub mod ssh;
 
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -19,6 +22,74 @@ enum ExitReason {
     Kicked(String),
     Killed,
     ServerDisconnected,
+    SessionEnded,
+}
+
+/// Result of processing a single server message.
+enum MsgAction {
+    Continue,
+    Exit(ExitReason),
+}
+
+/// Process a single S2C message, writing any terminal output to `stdout`.
+/// Returns `MsgAction::Exit` if the session should end.
+fn handle_server_msg(
+    msg: S2C,
+    stdout: &mut std::io::Stdout,
+    local_kkp_active: &mut bool,
+    local_dec_modes: &mut std::collections::HashSet<u16>,
+    last_pong: &mut Instant,
+) -> std::io::Result<MsgAction> {
+    match msg {
+        S2C::Snapshot(snapshot) => {
+            render::render_snapshot(stdout, &snapshot)?;
+        }
+        S2C::ScreenData { data } => {
+            stdout.write_all(b"\x1b[?2026h")?;
+            stdout.write_all(&data)?;
+            stdout.write_all(b"\x1b[?2026l")?;
+        }
+        S2C::ScreenDiff { data } => {
+            stdout.write_all(&data)?;
+        }
+        S2C::SetKkpMode { flags } => {
+            if flags > 0 {
+                if *local_kkp_active {
+                    write!(stdout, "\x1b[<u")?;
+                }
+                write!(stdout, "\x1b[>{flags}u")?;
+                *local_kkp_active = true;
+            } else if *local_kkp_active {
+                write!(stdout, "\x1b[<u")?;
+                *local_kkp_active = false;
+            }
+        }
+        S2C::SetDecMode { mode, enabled } => {
+            if enabled {
+                write!(stdout, "\x1b[?{mode}h")?;
+                local_dec_modes.insert(mode);
+            } else {
+                write!(stdout, "\x1b[?{mode}l")?;
+                local_dec_modes.remove(&mode);
+            }
+        }
+        S2C::Clipboard { params, data } => {
+            write!(stdout, "\x1b]52;{params};{data}\x07")?;
+        }
+        S2C::Kicked { reason } => {
+            info!("kicked: {reason}");
+            return Ok(MsgAction::Exit(ExitReason::Kicked(reason)));
+        }
+        S2C::SessionEnded => {
+            info!("session ended");
+            return Ok(MsgAction::Exit(ExitReason::SessionEnded));
+        }
+        S2C::Pong { .. } => {
+            *last_pong = Instant::now();
+        }
+        _ => {}
+    }
+    Ok(MsgAction::Continue)
 }
 
 /// Clean up KKP and DEC modes on the local terminal.
@@ -44,23 +115,27 @@ fn cleanup_terminal_modes(
 /// Run a single connection session. Returns the exit reason and optionally
 /// the server message receiver (kept alive when kicked, for auto-reclaim).
 async fn run_session(
-    sock_path: &Path,
+    reader: Box<dyn AsyncRead + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
     session_name: &str,
+    display_host: &str,
+    is_remote: bool,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(ExitReason, Option<mpsc::Receiver<S2C>>)> {
     // Get terminal size
     let (cols, rows) = crossterm::terminal::size()?;
 
-    // Connect
-    let stream = net::connect(sock_path).await?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut writer = writer;
 
-    // Send Hello
+    // Send Hello (includes terminal dimensions so server can resize before first render)
     let hello = C2S::Hello {
         caps: ClientCapabilities {
             supports_kkp: true,
             supports_truecolor: true,
             term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+            width: cols,
+            height: rows,
         },
     };
     write_frame_async(&mut writer, &hello).await?;
@@ -76,33 +151,13 @@ async fn run_session(
         }
     };
 
-    // Set terminal title to HOSTNAME/session_name
+    // Set terminal title to display_host/session_name (save original title first)
     {
-        let hostname = std::env::var("HOSTNAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var("HOST").ok().filter(|s| !s.is_empty()))
-                .or_else(|| {
-                    hostname::get()
-                        .ok()
-                        .and_then(|s| s.into_string().ok())
-                        .filter(|s| !s.is_empty())
-                })
-                .unwrap_or_else(|| "unknown".to_string());
         let mut stdout = std::io::stdout();
-        let _ = write!(stdout, "\x1b]0;{hostname}/{session_name}\x07");
+        // Save current title on the XTERM title stack, then set our title
+        let _ = write!(stdout, "\x1b[22;0t\x1b]0;{display_host}/{session_name}\x07");
         let _ = stdout.flush();
     }
-
-    // Send initial resize
-    write_frame_async(
-        &mut writer,
-        &C2S::Resize {
-            width: cols,
-            height: rows,
-        },
-    )
-    .await?;
 
     // Spawn task to read server messages
     let (server_tx, server_rx) = mpsc::channel::<S2C>(64);
@@ -136,10 +191,18 @@ async fn run_session(
     let mut exit_reason = ExitReason::ServerDisconnected;
     let mut server_rx = Some(server_rx);
 
+    // Keepalive state (only active for remote sessions)
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(5));
+    keepalive_interval.tick().await; // consume initial tick
+    let mut last_pong = Instant::now();
+
     let result: Result<()> = async {
         loop {
+            // biased; ensures input is always forwarded before rendering output
             tokio::select! {
-                // Local stdin → send to server
+                biased;
+
+                // Local stdin → send to server (highest priority)
                 Some(data) = stdin_rx.recv() => {
                     let result = detach_filter.feed(&data);
                     if !result.forward.is_empty() {
@@ -154,68 +217,8 @@ async fn run_session(
                         exit_reason = ExitReason::Detached;
                         break;
                     }
-                }
-
-                // Server messages
-                msg = async {
-                    match server_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match msg {
-                        Some(S2C::Snapshot(snapshot)) => {
-                            render::render_snapshot(&mut stdout, &snapshot)?;
-                        }
-                        Some(S2C::ScreenData { data }) => {
-                            stdout.write_all(b"\x1b[2J\x1b[H")?;
-                            stdout.write_all(&data)?;
-                            stdout.flush()?;
-                        }
-                        Some(S2C::ScreenDiff { data }) => {
-                            stdout.write_all(&data)?;
-                            stdout.flush()?;
-                        }
-                        Some(S2C::SetKkpMode { flags }) => {
-                            if flags > 0 {
-                                if local_kkp_active {
-                                    write!(stdout, "\x1b[<u")?;
-                                }
-                                write!(stdout, "\x1b[>{flags}u")?;
-                                stdout.flush()?;
-                                local_kkp_active = true;
-                            } else if local_kkp_active {
-                                write!(stdout, "\x1b[<u")?;
-                                stdout.flush()?;
-                                local_kkp_active = false;
-                            }
-                        }
-                        Some(S2C::SetDecMode { mode, enabled }) => {
-                            if enabled {
-                                write!(stdout, "\x1b[?{mode}h")?;
-                                local_dec_modes.insert(mode);
-                            } else {
-                                write!(stdout, "\x1b[?{mode}l")?;
-                                local_dec_modes.remove(&mode);
-                            }
-                            stdout.flush()?;
-                        }
-                        Some(S2C::Clipboard { params, data }) => {
-                            write!(stdout, "\x1b]52;{params};{data}\x07")?;
-                            stdout.flush()?;
-                        }
-                        Some(S2C::Kicked { reason }) => {
-                            info!("kicked: {reason}");
-                            exit_reason = ExitReason::Kicked(reason);
-                            break;
-                        }
-                        Some(S2C::Pong { .. }) => {}
-                        Some(_) => {}
-                        None => {
-                            info!("server disconnected");
-                            exit_reason = ExitReason::ServerDisconnected;
-                            break;
-                        }
+                    if result.refresh {
+                        write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
                     }
                 }
 
@@ -223,6 +226,65 @@ async fn run_session(
                 _ = sigwinch.recv() => {
                     let (cols, rows) = crossterm::terminal::size()?;
                     write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
+                }
+
+                // Application-layer keepalive (remote sessions only)
+                _ = keepalive_interval.tick(), if is_remote => {
+                    if last_pong.elapsed() > Duration::from_secs(15) {
+                        info!("keepalive timeout — no pong received in 15s");
+                        exit_reason = ExitReason::ServerDisconnected;
+                        break;
+                    }
+                    let t = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    write_frame_async(&mut writer, &C2S::Ping { t }).await?;
+                }
+
+                // Server messages (lowest priority — render after input is handled)
+                msg = async {
+                    match server_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match msg {
+                        Some(msg) => {
+                            if let MsgAction::Exit(reason) = handle_server_msg(
+                                msg, &mut stdout, &mut local_kkp_active,
+                                &mut local_dec_modes, &mut last_pong,
+                            )? {
+                                exit_reason = reason;
+                                stdout.flush()?;
+                                break;
+                            }
+                        }
+                        None => {
+                            info!("server disconnected");
+                            exit_reason = ExitReason::ServerDisconnected;
+                            break;
+                        }
+                    }
+                    // Drain queued server messages before flushing so
+                    // multiple updates (e.g. DEC mode + diff) are written
+                    // to the terminal in a single flush.
+                    if let Some(rx) = server_rx.as_mut() {
+                        while let Ok(msg) = rx.try_recv() {
+                            if let MsgAction::Exit(reason) = handle_server_msg(
+                                msg, &mut stdout, &mut local_kkp_active,
+                                &mut local_dec_modes, &mut last_pong,
+                            )? {
+                                exit_reason = reason;
+                                stdout.flush()?;
+                                break;
+                            }
+                        }
+                        if matches!(exit_reason, ExitReason::Kicked(_) | ExitReason::SessionEnded) {
+                            break;
+                        }
+                    }
+                    stdout.flush()?;
                 }
             }
         }
@@ -246,6 +308,7 @@ async fn run_session(
 /// Action from the kicked overlay.
 enum OverlayAction {
     Reconnect,
+    SessionEnded,
     Exit,
 }
 
@@ -280,16 +343,32 @@ async fn wait_for_overlay_action(
                 }
             } => {
                 match msg {
+                    Some(S2C::SessionEnded) => return OverlayAction::SessionEnded,
                     Some(S2C::SessionAvailable) => return OverlayAction::Reconnect,
-                    Some(_) => {} // ignore other messages
+                    Some(_) => {}
                     None => {
-                        // Server gone — disable this branch
-                        server_rx = None;
+                        // Server gone (connection dropped) — session is gone
+                        return OverlayAction::SessionEnded;
                     }
                 }
             }
         }
     }
+}
+
+/// Resolve the local hostname for terminal title display.
+fn local_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOST").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|s| s.into_string().ok())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
@@ -300,8 +379,24 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
     input::spawn_stdin_reader(stdin_tx);
 
+    let hostname = local_hostname();
+
     let result = loop {
-        match run_session(sock_path, session_name, &mut stdin_rx).await {
+        let stream = match net::connect(sock_path).await {
+            Ok(s) => s,
+            Err(e) => break Err(e),
+        };
+        let (reader, writer) = tokio::io::split(stream);
+        match run_session(
+            Box::new(reader),
+            Box::new(writer),
+            session_name,
+            &hostname,
+            false,
+            &mut stdin_rx,
+        )
+        .await
+        {
             Ok((ExitReason::Kicked(reason), mut server_rx)) => {
                 // Show overlay and wait for user decision or auto-reclaim
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -318,6 +413,15 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                         info!("reclaiming session after kick");
                         continue;
                     }
+                    OverlayAction::SessionEnded => {
+                        // Update overlay to show session ended, wait for key
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let mut stdout = std::io::stdout();
+                        let _ = render::render_session_ended_overlay(&mut stdout, cols, rows);
+                        // Wait for any key to dismiss
+                        let _ = stdin_rx.recv().await;
+                        break Ok(Some(ExitReason::ServerDisconnected));
+                    }
                     OverlayAction::Exit => {
                         break Ok(Some(ExitReason::Kicked(reason)));
                     }
@@ -325,21 +429,110 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
             }
             Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
             Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
+            Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
             Ok((ExitReason::ServerDisconnected, _)) => break Ok(Some(ExitReason::ServerDisconnected)),
             Err(e) => break Err(e),
         }
     };
 
-    // Ensure terminal is cleaned up on exit
     drop(_raw);
+    cleanup_terminal(session_name, &result);
+    result.map(|_| ())
+}
+
+/// Action from the reconnect overlay.
+enum ReconnectAction {
+    Retry,
+    Exit,
+}
+
+/// Wait for manual user input only (no countdown, no server_rx).
+/// Used when a remote client is kicked — the user must explicitly choose to reclaim.
+async fn wait_for_manual_action(
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> ReconnectAction {
+    loop {
+        match stdin_rx.recv().await {
+            Some(data) => {
+                for &b in &data {
+                    match b {
+                        // Space or Enter → retry
+                        0x20 | 0x0d | 0x0a => return ReconnectAction::Retry,
+                        // q or Esc → exit
+                        b'q' | 0x1b => return ReconnectAction::Exit,
+                        _ => {}
+                    }
+                }
+            }
+            None => return ReconnectAction::Exit,
+        }
+    }
+}
+
+/// Show reconnect overlay with countdown and wait for user input or timeout.
+async fn show_reconnect_overlay(
+    host: &str,
+    session: &str,
+    attempt: u32,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> ReconnectAction {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut stdout = std::io::stdout();
+    let countdown_secs: u32 = 3;
+    let mut remaining = countdown_secs;
+
+    let _ = render::render_reconnect_overlay(
+        &mut stdout, cols, rows, host, session, attempt, remaining,
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.tick().await; // first tick is immediate
+
+    loop {
+        tokio::select! {
+            data = stdin_rx.recv() => {
+                if let Some(data) = data {
+                    for &b in &data {
+                        match b {
+                            // Enter or Space → retry now
+                            0x0d | 0x0a | 0x20 => return ReconnectAction::Retry,
+                            // q or Esc → exit
+                            b'q' | 0x1b => return ReconnectAction::Exit,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    return ReconnectAction::Exit;
+                }
+            }
+            _ = interval.tick() => {
+                remaining = remaining.saturating_sub(1);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let _ = render::render_reconnect_overlay(
+                    &mut stdout, cols, rows, host, session, attempt, remaining,
+                );
+                if remaining == 0 {
+                    return ReconnectAction::Retry;
+                }
+            }
+        }
+    }
+}
+
+/// Terminal cleanup shared by run() and run_remote().
+fn cleanup_terminal(session_name: &str, result: &Result<Option<ExitReason>>) {
     let _ = crossterm::terminal::disable_raw_mode();
     let mut stdout = std::io::stdout();
-    // Pop any KKP modes we may have pushed, reset attributes, clear screen, show cursor
-    let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h");
+    // Defensive: disable common DEC modes that break terminal usability
+    let _ = write!(stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"); // mouse tracking
+    let _ = write!(stdout, "\x1b[?2004l"); // bracketed paste
+    let _ = write!(stdout, "\x1b[?1049l"); // alternate screen buffer
+    let _ = write!(stdout, "\x1b[?2026l"); // synchronized update
+    // KKP pop, reset attrs, clear screen, cursor home, show cursor, restore title
+    let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h\x1b[23;0t");
     let _ = stdout.flush();
 
-    // Print exit reason to stderr (after terminal is restored)
-    match &result {
+    match result {
         Ok(Some(ExitReason::Detached)) => {
             eprintln!("mux: detached from session '{session_name}'");
         }
@@ -349,12 +542,77 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
         Ok(Some(ExitReason::Killed)) => {
             eprintln!("mux: killed session '{session_name}'");
         }
-        Ok(Some(ExitReason::ServerDisconnected)) => {
+        Ok(Some(ExitReason::SessionEnded)) | Ok(Some(ExitReason::ServerDisconnected)) => {
             eprintln!("mux: server disconnected");
         }
         Ok(None) => {}
         Err(_) => {}
     }
+}
+
+/// Attach to a remote session over SSH with automatic reconnection.
+pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_options: &ssh::SshOptions) -> Result<()> {
+    let _raw = input::RawInput::enable()?;
+
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    input::spawn_stdin_reader(stdin_tx);
+
+    let mut attempt = 0u32;
+
+    let result: Result<Option<ExitReason>> = loop {
+        // Connect via SSH
+        let ssh_conn = match ssh::connect(host, session, program, ssh_options).await {
+            Ok(conn) => {
+                attempt = 0;
+                conn
+            }
+            Err(e) => {
+                attempt += 1;
+                info!("SSH connection failed (attempt {attempt}): {e}");
+                match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
+                    ReconnectAction::Retry => continue,
+                    ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
+                }
+            }
+        };
+
+        let (reader, writer) = ssh_conn;
+
+        match run_session(reader, writer, session, host, true, &mut stdin_rx).await {
+            Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
+            Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
+            Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
+            Ok((ExitReason::ServerDisconnected, _)) => {
+                attempt += 1;
+                info!("server disconnected, attempting reconnect (attempt {attempt})");
+                match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
+                    ReconnectAction::Retry => continue,
+                    ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
+                }
+            }
+            Ok((ExitReason::Kicked(_), _)) => {
+                // Remote kicked — show manual-only overlay (no auto-reconnect)
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let mut stdout = std::io::stdout();
+                let _ = render::render_remote_kicked_overlay(&mut stdout, cols, rows);
+                match wait_for_manual_action(&mut stdin_rx).await {
+                    ReconnectAction::Retry => { attempt = 0; continue; }
+                    ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
+                }
+            }
+            Err(e) => {
+                attempt += 1;
+                info!("session error (attempt {attempt}): {e}");
+                match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
+                    ReconnectAction::Retry => continue,
+                    ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
+                }
+            }
+        }
+    };
+
+    drop(_raw);
+    cleanup_terminal(session, &result);
 
     result.map(|_| ())
 }

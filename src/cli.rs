@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
 
+const VERSION: &str = match option_env!("MUX_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "mux")]
+#[command(name = "mux", version = VERSION)]
 pub struct Cli {
     /// Session name to attach to or create
     pub name: Option<String>,
@@ -40,4 +45,31 @@ pub enum Commands {
         #[arg(last = true)]
         program: Vec<String>,
     },
+    /// Internal: bridge stdin/stdout to a session socket (used by SSH remote)
+    #[command(hide = true)]
+    Bridge {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        cols: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
+        #[arg(last = true)]
+        program: Vec<String>,
+    },
+}
+
+pub enum SessionTarget {
+    Local(String),
+    Remote { host: String, session: String },
+}
+
+pub fn parse_target(name: &str) -> SessionTarget {
+    match name.split_once('/') {
+        Some((host, session)) => SessionTarget::Remote {
+            host: host.to_string(),
+            session: session.to_string(),
+        },
+        None => SessionTarget::Local(name.to_string()),
+    }
 }

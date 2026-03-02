@@ -34,7 +34,7 @@ fn lock_session(name: &str) -> Result<File> {
 /// Ensure a server is running for the given session name.
 /// If one is already alive, returns Ok immediately.
 /// If the socket is stale, removes it and starts a new server.
-pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
+pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
     // Hold an advisory lock to prevent two clients from racing
     let _lock = lock_session(name)?;
 
@@ -49,17 +49,20 @@ pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
         let _ = std::fs::remove_file(&sock);
     }
 
-    // Open log file in append mode
+    // Open log file, truncating any previous content
     let log_file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(paths::log_path(name))
         .context("failed to open log file")?;
 
     let log_file_err = log_file.try_clone().context("failed to clone log file")?;
 
-    // Query the current terminal size so the PTY starts at the right dimensions
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Use the provided size (from remote client) or query the local terminal
+    let (cols, rows) = initial_size.unwrap_or_else(|| {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    });
 
     // Re-exec ourselves as: mux server --session <name>
     let exe = std::env::current_exe().context("failed to get current exe")?;
@@ -81,7 +84,9 @@ pub fn ensure_server(name: &str, program: &[String]) -> Result<()> {
     // Detach from terminal via setsid
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -106,13 +111,58 @@ fn try_connect_sync(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// Bridge stdin/stdout to a session socket (used by SSH remote).
+/// This is a pure byte relay — it does not parse protocol messages.
+pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
+    // Update SSH agent symlink before connecting — the bridge inherits
+    // SSH_AUTH_SOCK from sshd, so this points the stable symlink at the
+    // real remote agent socket.
+    let _ = paths::update_agent_link(session);
+
+    // Ensure server is running with the client's terminal size (passed via CLI args).
+    ensure_server(session, program, initial_size)?;
+
+    let sock = paths::socket_path(session);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&sock).await?;
+        let (mut sock_reader, mut sock_writer) = tokio::io::split(stream);
+
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+
+        tokio::select! {
+            r = tokio::io::copy(&mut stdin, &mut sock_writer) => {
+                r.context("bridge: stdin → socket copy failed")?;
+            }
+            r = tokio::io::copy(&mut sock_reader, &mut stdout) => {
+                r.context("bridge: socket → stdout copy failed")?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
 /// Run the server in the current process (called by `mux server --session <name>`).
 pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Result<()> {
     let sock = paths::socket_path(name);
 
     let config = Config::load();
     let resolved_program = config.resolve_program(program);
-    let extra_env = config.resolve_env(name);
+    let mut extra_env = config.resolve_env(name);
+
+    // Point PTY's SSH_AUTH_SOCK at the stable symlink so reconnections
+    // can update the target without changing the PTY environment.
+    extra_env.push((
+        "SSH_AUTH_SOCK".to_string(),
+        paths::agent_link_path(name).to_string_lossy().into_owned(),
+    ));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

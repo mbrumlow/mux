@@ -1,6 +1,7 @@
 const PREFIX_RAW: u8 = 0x1C; // Ctrl+backslash as raw byte
 const DETACH_RAW: u8 = b'd';
 const KILL_RAW: u8 = b'k';
+const REFRESH_RAW: u8 = b'r';
 const ESC: u8 = 0x1b;
 const MAX_SEQ_LEN: usize = 64;
 
@@ -8,11 +9,13 @@ const MAX_SEQ_LEN: usize = 64;
 const KKP_BACKSLASH: u32 = 92;
 const KKP_D: u32 = 100;
 const KKP_K: u32 = 107;
+const KKP_R: u32 = 114;
 
 pub struct FilterResult {
     pub forward: Vec<u8>,
     pub detach: bool,
     pub kill: bool,
+    pub refresh: bool,
 }
 
 enum State {
@@ -56,6 +59,10 @@ fn is_plain_d(keycode: u32, modifiers: u32) -> bool {
 
 fn is_plain_k(keycode: u32, modifiers: u32) -> bool {
     keycode == KKP_K && modifiers == 1
+}
+
+fn is_plain_r(keycode: u32, modifiers: u32) -> bool {
+    keycode == KKP_R && modifiers == 1
 }
 
 /// True for bytes that are CSI parameter characters (digits, ; :)
@@ -157,6 +164,7 @@ impl DetachFilter {
                             forward,
                             detach: true,
                             kill: false,
+                            refresh: false,
                         };
                     } else if b == KILL_RAW {
                         self.state = State::Normal;
@@ -164,6 +172,15 @@ impl DetachFilter {
                             forward,
                             detach: false,
                             kill: true,
+                            refresh: false,
+                        };
+                    } else if b == REFRESH_RAW {
+                        self.state = State::Normal;
+                        return FilterResult {
+                            forward,
+                            detach: false,
+                            kill: false,
+                            refresh: true,
                         };
                     } else if b == PREFIX_RAW {
                         // Raw escape: forward one literal 0x1C
@@ -207,6 +224,7 @@ impl DetachFilter {
                                     forward,
                                     detach: true,
                                     kill: false,
+                                    refresh: false,
                                 };
                             } else if is_plain_k(kc, mods) {
                                 self.seq_buf.clear();
@@ -215,6 +233,16 @@ impl DetachFilter {
                                     forward,
                                     detach: false,
                                     kill: true,
+                                    refresh: false,
+                                };
+                            } else if is_plain_r(kc, mods) {
+                                self.seq_buf.clear();
+                                self.state = State::Normal;
+                                return FilterResult {
+                                    forward,
+                                    detach: false,
+                                    kill: false,
+                                    refresh: true,
                                 };
                             } else if is_ctrl_backslash(kc, mods) {
                                 // KKP escape: forward one KKP Ctrl+\ sequence
@@ -246,6 +274,7 @@ impl DetachFilter {
             forward,
             detach: false,
             kill: false,
+            refresh: false,
         }
     }
 }

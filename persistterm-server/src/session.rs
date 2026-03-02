@@ -23,6 +23,9 @@ struct ClientConn {
     _read_task: tokio::task::JoinHandle<()>,
 }
 
+/// Maximum number of kicked clients kept in the waiting queue.
+const MAX_WAITING_CLIENTS: usize = 8;
+
 /// A kicked client that is still connected and waiting to reclaim.
 struct WaitingClient {
     writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
@@ -58,13 +61,87 @@ async fn notify_next_waiting(waiting: &mut VecDeque<WaitingClient>) {
     }
 }
 
+/// Notify all connected clients (active + waiting) that the session has ended.
+async fn notify_session_ended(
+    client: &mut Option<ClientConn>,
+    waiting: &mut VecDeque<WaitingClient>,
+) {
+    if let Some(conn) = client.as_mut() {
+        let _ = write_frame_async(&mut conn.writer, &S2C::SessionEnded).await;
+    }
+    for w in waiting.iter_mut() {
+        if !w.dead.load(Ordering::Relaxed) {
+            let _ = write_frame_async(&mut w.writer, &S2C::SessionEnded).await;
+        }
+    }
+}
+
+/// Channel-backed writer that offloads blocking PTY writes to a dedicated thread.
+/// Both the session loop and wezterm-term can clone and write without blocking
+/// the tokio runtime.
+struct ChannelWriter {
+    tx: std::sync::mpsc::SyncSender<WriterMsg>,
+}
+
+enum WriterMsg {
+    Data(Vec<u8>),
+    Flush,
+}
+
+impl ChannelWriter {
+    /// Spawn a dedicated writer thread and return a ChannelWriter.
+    fn spawn(mut inner: Box<dyn Write + Send>) -> Self {
+        // Bounded channel provides backpressure without unbounded memory growth.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(256);
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    WriterMsg::Data(data) => {
+                        if inner.write_all(&data).is_err() {
+                            break;
+                        }
+                    }
+                    WriterMsg::Flush => {
+                        if inner.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn clone_boxed(&self) -> Box<dyn Write + Send> {
+        Box::new(ChannelWriter {
+            tx: self.tx.clone(),
+        })
+    }
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let len = buf.len();
+        self.tx
+            .send(WriterMsg::Data(buf.to_vec()))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))?;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tx
+            .send(WriterMsg::Flush)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))
+    }
+}
+
 pub struct Session {
     name: String,
     pty: PtyHandle,
-    pty_writer: Box<dyn Write + Send>,
+    pty_writer: ChannelWriter,
     terminal: Terminal,
     listener: Listener,
-    pty_rx: mpsc::Receiver<Vec<u8>>,
+    pty_rx: mpsc::Receiver<Box<[u8]>>,
 }
 
 impl Session {
@@ -77,11 +154,13 @@ impl Session {
         extra_env: &[(String, String)],
     ) -> Result<Self> {
         let (pty, pty_reader, pty_writer) = PtyHandle::spawn(rows, cols, program, name, extra_env)?;
-        let terminal = Terminal::new(rows, cols);
+        let channel_writer = ChannelWriter::spawn(pty_writer);
+        let term_writer = channel_writer.clone_boxed();
+        let terminal = Terminal::new(rows, cols, term_writer);
         let listener = Listener::bind(sock_path)?;
 
         // Spawn blocking reader for PTY output
-        let (pty_tx, pty_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (pty_tx, pty_rx) = mpsc::channel::<Box<[u8]>>(256);
         std::thread::spawn(move || {
             read_pty_loop(pty_reader, pty_tx);
         });
@@ -89,7 +168,7 @@ impl Session {
         Ok(Self {
             name: name.to_string(),
             pty,
-            pty_writer,
+            pty_writer: channel_writer,
             terminal,
             listener,
             pty_rx,
@@ -100,150 +179,43 @@ impl Session {
         let mut client: Option<ClientConn> = None;
         let mut waiting: VecDeque<WaitingClient> = VecDeque::new();
         let mut dirty = false;
-        let mut interval = tokio::time::interval(Duration::from_millis(16));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Debounce timestamps: wait for PTY output to go quiet before sending
+        // a diff so we capture complete application redraws (e.g. emacs
+        // updating btop in a split pane) rather than intermediate states.
+        let mut dirty_since: Option<tokio::time::Instant> = None;
+        let mut last_pty_at: Option<tokio::time::Instant> = None;
+        // How long to wait after the last PTY data before sending a diff.
+        const QUIESCE_MS: u64 = 3;
+        // Maximum latency cap — send a diff at least this often during
+        // continuous output (keeps responsiveness for fast-scrolling).
+        const MAX_LATENCY_MS: u64 = 16;
+        // Maximum time to honour an app's synchronized update (DEC 2026)
+        // before force-rendering. Prevents hangs if the app never sends
+        // the closing sequence.
+        const MAX_SYNC_MS: u64 = 500;
+        // Periodic full-screen refresh interval. Repairs screen corruption
+        // caused by the outer terminal (e.g. kitty's clear_terminal action)
+        // manipulating its display behind mux's back.
+        const REFRESH_SECS: u64 = 2;
+        let mut refresh_interval = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
+        // Don't fire immediately on startup (client gets a full screen on connect).
+        refresh_interval.reset();
 
         let mut sigterm = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
         )?;
 
         loop {
+            // Capture sync state before select — can't borrow self inside
+            // the async block since other branches need &mut self.
+            let app_sync = self.terminal.is_app_sync_active();
+
+            // biased; ensures deterministic priority:
+            // client input > signals > PTY output > screen updates > new connections
             tokio::select! {
-                // ── SIGTERM → clean shutdown ──────────────────────────
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM, shutting down");
-                    waiting.clear();
-                    return Ok(());
-                }
-                // ── PTY output (always active) ──────────────────────────
-                data = self.pty_rx.recv() => {
-                    match data {
-                        Some(data) => {
-                            let events = self.terminal.process(&data);
+                biased;
 
-                            // Inject terminal query responses back into PTY
-                            if !events.pty_responses.is_empty() {
-                                for response in &events.pty_responses {
-                                    if let Err(e) = self.pty_writer.write_all(response) {
-                                        error!("failed to inject terminal query response: {e}");
-                                    }
-                                }
-                                let _ = self.pty_writer.flush();
-                            }
-
-                            // Forward KKP mode changes to client
-                            if let Some(flags) = events.kkp_changed {
-                                info!(flags, "KKP mode changed");
-                                if let Some(conn) = client.as_mut() {
-                                    if let Err(e) = write_frame_async(
-                                        &mut conn.writer,
-                                        &S2C::SetKkpMode { flags },
-                                    ).await {
-                                        warn!("failed to send KKP mode, dropping client: {e}");
-                                        drop(client.take());
-                                        notify_next_waiting(&mut waiting).await;
-                                    }
-                                }
-                            }
-
-                            // Forward DEC private mode changes to client
-                            for &(mode, enabled) in &events.dec_mode_changes {
-                                info!(mode, enabled, "DEC private mode changed");
-                                if let Some(conn) = client.as_mut() {
-                                    if let Err(e) = write_frame_async(
-                                        &mut conn.writer,
-                                        &S2C::SetDecMode { mode, enabled },
-                                    ).await {
-                                        warn!("failed to send DEC mode, dropping client: {e}");
-                                        drop(client.take());
-                                        notify_next_waiting(&mut waiting).await;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Forward OSC sequences (clipboard etc.) to client
-                            if !events.osc_forwards.is_empty() {
-                                if let Some(conn) = client.as_mut() {
-                                    for osc_body in &events.osc_forwards {
-                                        // Parse "52;PARAMS;DATA" from the body
-                                        if let Ok(body_str) = std::str::from_utf8(osc_body) {
-                                            if let Some(rest) = body_str.strip_prefix("52;") {
-                                                if let Some((params, data)) = rest.split_once(';') {
-                                                    if let Err(e) = write_frame_async(
-                                                        &mut conn.writer,
-                                                        &S2C::Clipboard {
-                                                            params: params.to_string(),
-                                                            data: data.to_string(),
-                                                        },
-                                                    ).await {
-                                                        warn!("failed to send clipboard, dropping client: {e}");
-                                                        drop(client.take());
-                                                        notify_next_waiting(&mut waiting).await;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            dirty = true;
-                        }
-                        None => {
-                            info!("shell exited, ending session");
-                            waiting.clear();
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // ── Accept new client (kick existing only after handshake) ──
-                result = self.listener.accept() => {
-                    match result {
-                        Ok(stream) => {
-                            // Complete handshake BEFORE kicking, so that
-                            // probe connections (e.g. --list liveness check)
-                            // that never send Hello don't disrupt the
-                            // active client.
-                            match self.accept_client(stream).await {
-                                Ok(conn) => {
-                                    if let Some(mut old) = client.take() {
-                                        let _ = write_frame_async(
-                                            &mut old.writer,
-                                            &S2C::Kicked { reason: "another client connected".to_string() },
-                                        ).await;
-                                        waiting.push_back(kick_to_waiting(old));
-                                    }
-                                    client = Some(conn);
-                                    dirty = false;
-                                }
-                                Err(e) => {
-                                    warn!("client handshake failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("accept error: {e}");
-                        }
-                    }
-                }
-
-                // ── Timer tick → send diff if dirty ──────────────────────
-                _ = interval.tick(), if client.is_some() && dirty => {
-                    if let Some(data) = self.terminal.screen_diff() {
-                        let conn = client.as_mut().unwrap();
-                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
-                            warn!("failed to send screen diff, dropping client: {e}");
-                            drop(client.take());
-                            notify_next_waiting(&mut waiting).await;
-                        }
-                    }
-                    dirty = false;
-                }
-
-                // ── Client messages ─────────────────────────────────────
+                // ── Client messages (highest priority) ──────────────────
                 msg = async {
                     match client.as_mut() {
                         Some(c) => c.msg_rx.recv().await,
@@ -285,6 +257,7 @@ impl Session {
                         }
                         Some(C2S::KillSession) => {
                             info!("client requested session kill");
+                            notify_session_ended(&mut client, &mut waiting).await;
                             waiting.clear();
                             return Ok(());
                         }
@@ -308,6 +281,221 @@ impl Session {
                         }
                     }
                 }
+
+                // ── SIGTERM → clean shutdown ──────────────────────────
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down");
+                    notify_session_ended(&mut client, &mut waiting).await;
+                    waiting.clear();
+                    return Ok(());
+                }
+
+                // ── PTY output ────────────────────────────────────────
+                data = self.pty_rx.recv() => {
+                    match data {
+                        Some(first) => {
+                            // Process the first chunk
+                            let mut all_events = self.terminal.process(&first);
+
+                            // Drain queued PTY data so we see the final state of
+                            // the app's redraw (e.g. cursor hidden mid-redraw).
+                            // Cap iterations so we yield back to handle input.
+                            let mut drained = 0;
+                            while drained < 64 {
+                                match self.pty_rx.try_recv() {
+                                    Ok(more) => {
+                                        let ev = self.terminal.process(&more);
+                                        if ev.kkp_changed.is_some() {
+                                            all_events.kkp_changed = ev.kkp_changed;
+                                        }
+                                        all_events.dec_mode_changes.extend(ev.dec_mode_changes);
+                                        all_events.osc_forwards.extend(ev.osc_forwards);
+                                        drained += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            // Forward KKP mode changes to client
+                            if let Some(flags) = all_events.kkp_changed {
+                                info!(flags, "KKP mode changed");
+                                if let Some(conn) = client.as_mut() {
+                                    if let Err(e) = write_frame_async(
+                                        &mut conn.writer,
+                                        &S2C::SetKkpMode { flags },
+                                    ).await {
+                                        warn!("failed to send KKP mode, dropping client: {e}");
+                                        drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
+                                    }
+                                }
+                            }
+
+                            // Forward DEC private mode changes to client
+                            for &(mode, enabled) in &all_events.dec_mode_changes {
+                                info!(mode, enabled, "DEC private mode changed");
+                                if let Some(conn) = client.as_mut() {
+                                    if let Err(e) = write_frame_async(
+                                        &mut conn.writer,
+                                        &S2C::SetDecMode { mode, enabled },
+                                    ).await {
+                                        warn!("failed to send DEC mode, dropping client: {e}");
+                                        drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Forward OSC sequences (clipboard etc.) to client
+                            if !all_events.osc_forwards.is_empty() {
+                                if let Some(conn) = client.as_mut() {
+                                    for osc_body in &all_events.osc_forwards {
+                                        if let Ok(body_str) = std::str::from_utf8(osc_body) {
+                                            if let Some(rest) = body_str.strip_prefix("52;") {
+                                                if let Some((params, data)) = rest.split_once(';') {
+                                                    if let Err(e) = write_frame_async(
+                                                        &mut conn.writer,
+                                                        &S2C::Clipboard {
+                                                            params: params.to_string(),
+                                                            data: data.to_string(),
+                                                        },
+                                                    ).await {
+                                                        warn!("failed to send clipboard, dropping client: {e}");
+                                                        drop(client.take());
+                                                        notify_next_waiting(&mut waiting).await;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Update debounce timestamps
+                            let now = tokio::time::Instant::now();
+                            if dirty_since.is_none() {
+                                dirty_since = Some(now);
+                            }
+                            last_pty_at = Some(now);
+                            dirty = true;
+                        }
+                        None => {
+                            info!("shell exited, ending session");
+                            notify_session_ended(&mut client, &mut waiting).await;
+                            waiting.clear();
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // ── Debounced render: wait for PTY quiescence or max latency ──
+                // During an app synchronized update (DEC 2026), we delay
+                // rendering until the app signals completion (or a safety
+                // timeout expires) so we never send a half-drawn frame.
+                _ = async {
+                    if app_sync {
+                        // App has an active sync update — wait up to MAX_SYNC_MS
+                        let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_SYNC_MS);
+                        tokio::time::sleep_until(max_at).await;
+                    } else {
+                        let quiesce_at = last_pty_at.unwrap() + Duration::from_millis(QUIESCE_MS);
+                        let max_at = dirty_since.unwrap() + Duration::from_millis(MAX_LATENCY_MS);
+                        tokio::time::sleep_until(quiesce_at.min(max_at)).await;
+                    }
+                }, if client.is_some() && dirty => {
+                    if let Some(data) = self.terminal.screen_diff() {
+                        let conn = client.as_mut().unwrap();
+                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                            warn!("failed to send screen diff, dropping client: {e}");
+                            drop(client.take());
+                            notify_next_waiting(&mut waiting).await;
+                        }
+                    }
+                    dirty = false;
+                    dirty_since = None;
+                    last_pty_at = None;
+                }
+
+                // ── Periodic full-screen refresh (repairs screen corruption) ──
+                _ = refresh_interval.tick(), if client.is_some() && !dirty => {
+                    if self.terminal.refresh_if_changed() {
+                        if let Some(data) = self.terminal.screen_diff() {
+                            let conn = client.as_mut().unwrap();
+                            if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                                warn!("failed to send refresh, dropping client: {e}");
+                                drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
+                            }
+                        }
+                    }
+                }
+
+                // ── Accept new client (kick existing only after handshake) ──
+                result = self.listener.accept() => {
+                    match result {
+                        Ok(stream) => {
+                            match self.accept_client(stream).await {
+                                Ok(conn) => {
+                                    if let Some(mut old) = client.take() {
+                                        let _ = write_frame_async(
+                                            &mut old.writer,
+                                            &S2C::Kicked { reason: "another client connected".to_string() },
+                                        ).await;
+                                        // Evict oldest waiting client if at capacity
+                                        while waiting.len() >= MAX_WAITING_CLIENTS {
+                                            waiting.pop_front();
+                                        }
+                                        waiting.push_back(kick_to_waiting(old));
+                                    }
+                                    client = Some(conn);
+                                    dirty = false;
+                                }
+                                Err(e) => {
+                                    warn!("client handshake failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("accept error: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After resizing the PTY, drain output briefly so the child process
+    /// can re-render at the new size before we capture the screen.
+    async fn drain_pty_after_resize(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut got_data = false;
+
+        loop {
+            let timeout = if got_data {
+                // After receiving data, wait for the app to finish its full
+                // redraw — complex apps (emacs, btop) redraw in multiple
+                // bursts with gaps between them.
+                (tokio::time::Instant::now() + Duration::from_millis(50)).min(deadline)
+            } else {
+                // Wait up to 100ms for the child to start responding to SIGWINCH
+                (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline)
+            };
+
+            tokio::select! {
+                data = self.pty_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            self.terminal.process(&data);
+                            got_data = true;
+                        }
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep_until(timeout) => {
+                    break;
+                }
             }
         }
     }
@@ -323,7 +511,20 @@ impl Session {
         let hello: C2S = read_frame_async(&mut reader).await?;
         match &hello {
             C2S::Hello { caps } => {
-                info!(term = %caps.term, kkp = caps.supports_kkp, "client hello");
+                info!(term = %caps.term, kkp = caps.supports_kkp,
+                      width = caps.width, height = caps.height, "client hello");
+                // Resize to client dimensions before sending initial screen data
+                if caps.width > 0 && caps.height > 0 {
+                    let size_changed = (caps.height, caps.width) != self.terminal.size();
+                    if let Err(e) = self.pty.resize(caps.height, caps.width) {
+                        error!("failed to resize PTY on hello: {e}");
+                    }
+                    self.terminal.resize(caps.height, caps.width);
+                    // If the size changed, give the child time to re-render
+                    if size_changed {
+                        self.drain_pty_after_resize().await;
+                    }
+                }
             }
             _ => {
                 anyhow::bail!("expected Hello, got something else");
@@ -339,7 +540,7 @@ impl Session {
         )
         .await?;
 
-        // Send initial full screen data
+        // Send initial full screen data (at client's dimensions)
         let data = self.terminal.screen_formatted();
         write_frame_async(&mut writer, &S2C::ScreenData { data }).await?;
         self.terminal.reset_prev_screen();
@@ -384,8 +585,8 @@ impl Session {
     }
 }
 
-fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
-    let mut buf = [0u8; 4096];
+fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Box<[u8]>>) {
+    let mut buf = [0u8; 32768];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -393,7 +594,7 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
                 break;
             }
             Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                if tx.blocking_send(buf[..n].into()).is_err() {
                     break;
                 }
             }
