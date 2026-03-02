@@ -26,10 +26,10 @@ fn main() -> Result<()> {
 
             daemon::run_server(session, *rows, *cols, program)
         }
-        Some(Commands::Bridge { session, cols, rows }) => {
+        Some(Commands::Bridge { session, cols, rows, program }) => {
             paths::validate_session_name(session)?;
             let initial_size = cols.zip(*rows);
-            daemon::run_bridge(session, initial_size)
+            daemon::run_bridge(session, program, initial_size)
         }
         None if cli.list => session_mgmt::list_sessions(),
         None if cli.kill.is_some() => {
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
                         .with_writer(log_file)
                         .init();
 
-                    session_mgmt::attach_remote(&host, &session)
+                    session_mgmt::attach_remote(&host, &session, &cli.program)
                 }
             }
         }

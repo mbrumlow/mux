@@ -569,7 +569,7 @@ fn cleanup_terminal(session_name: &str, result: &Result<Option<ExitReason>>) {
 }
 
 /// Attach to a remote session over SSH with automatic reconnection.
-pub async fn run_remote(host: &str, session: &str, ssh_options: &ssh::SshOptions) -> Result<()> {
+pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_options: &ssh::SshOptions) -> Result<()> {
     let _raw = input::RawInput::enable()?;
 
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -579,7 +579,7 @@ pub async fn run_remote(host: &str, session: &str, ssh_options: &ssh::SshOptions
 
     let result: Result<Option<ExitReason>> = loop {
         // Connect via SSH
-        let ssh_conn = match ssh::connect(host, session, ssh_options).await {
+        let ssh_conn = match ssh::connect(host, session, program, ssh_options).await {
             Ok(conn) => {
                 attempt = 0;
                 conn

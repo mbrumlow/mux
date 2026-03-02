@@ -102,7 +102,7 @@ pub fn attach(name: &str, program: &[String]) -> Result<()> {
 }
 
 /// Attach to a remote session over SSH.
-pub fn attach_remote(host: &str, session: &str) -> Result<()> {
+pub fn attach_remote(host: &str, session: &str, program: &[String]) -> Result<()> {
     let config = crate::config::Config::load();
     let ssh_options = persistterm_client::ssh::SshOptions {
         compression: config.ssh.compression,
@@ -113,7 +113,7 @@ pub fn attach_remote(host: &str, session: &str) -> Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
 
-    rt.block_on(persistterm_client::run_remote(host, session, &ssh_options))
+    rt.block_on(persistterm_client::run_remote(host, session, program, &ssh_options))
 }
 
 /// Get the PID of the peer process via socket credentials.

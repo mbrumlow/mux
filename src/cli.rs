@@ -54,6 +54,8 @@ pub enum Commands {
         cols: Option<u16>,
         #[arg(long)]
         rows: Option<u16>,
+        #[arg(last = true)]
+        program: Vec<String>,
     },
 }
 

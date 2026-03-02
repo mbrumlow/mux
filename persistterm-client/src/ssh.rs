@@ -77,6 +77,7 @@ fn parse_ssh_host(host_str: &str) -> (Option<String>, String, u16) {
 pub async fn connect(
     host_str: &str,
     session_name: &str,
+    program: &[String],
     options: &SshOptions,
 ) -> Result<(
     Box<dyn AsyncRead + Unpin + Send>,
@@ -137,7 +138,17 @@ pub async fn connect(
         bail!("MUX_REMOTE_BIN contains invalid characters: {mux_bin:?}");
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let command = format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
+    let mut command = format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
+    if !program.is_empty() {
+        command.push_str(" --");
+        for arg in program {
+            // Shell-escape each argument using single quotes
+            command.push(' ');
+            command.push('\'');
+            command.push_str(&arg.replace('\'', "'\\''"));
+            command.push('\'');
+        }
+    }
     channel
         .exec(true, command)
         .await

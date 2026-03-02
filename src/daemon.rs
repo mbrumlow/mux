@@ -113,14 +113,14 @@ fn try_connect_sync(path: &Path) -> bool {
 
 /// Bridge stdin/stdout to a session socket (used by SSH remote).
 /// This is a pure byte relay — it does not parse protocol messages.
-pub fn run_bridge(session: &str, initial_size: Option<(u16, u16)>) -> Result<()> {
+pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
     // Update SSH agent symlink before connecting — the bridge inherits
     // SSH_AUTH_SOCK from sshd, so this points the stable symlink at the
     // real remote agent socket.
     let _ = paths::update_agent_link(session);
 
     // Ensure server is running with the client's terminal size (passed via CLI args).
-    ensure_server(session, &[], initial_size)?;
+    ensure_server(session, program, initial_size)?;
 
     let sock = paths::socket_path(session);
 
