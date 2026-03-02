@@ -114,6 +114,11 @@ fn try_connect_sync(path: &Path) -> bool {
 /// Bridge stdin/stdout to a session socket (used by SSH remote).
 /// This is a pure byte relay — it does not parse protocol messages.
 pub fn run_bridge(session: &str, initial_size: Option<(u16, u16)>) -> Result<()> {
+    // Update SSH agent symlink before connecting — the bridge inherits
+    // SSH_AUTH_SOCK from sshd, so this points the stable symlink at the
+    // real remote agent socket.
+    let _ = paths::update_agent_link(session);
+
     // Ensure server is running with the client's terminal size (passed via CLI args).
     ensure_server(session, &[], initial_size)?;
 
@@ -150,7 +155,14 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
 
     let config = Config::load();
     let resolved_program = config.resolve_program(program);
-    let extra_env = config.resolve_env(name);
+    let mut extra_env = config.resolve_env(name);
+
+    // Point PTY's SSH_AUTH_SOCK at the stable symlink so reconnections
+    // can update the target without changing the PTY environment.
+    extra_env.push((
+        "SSH_AUTH_SOCK".to_string(),
+        paths::agent_link_path(name).to_string_lossy().into_owned(),
+    ));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -3,6 +3,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use tracing::debug;
 
 /// Validate a session name: [a-zA-Z0-9_-], max 64 chars.
 pub fn validate_session_name(name: &str) -> Result<()> {
@@ -72,6 +73,54 @@ pub fn ensure_dirs() -> Result<()> {
     verify_dir_security(&log)?;
 
     Ok(())
+}
+
+/// Stable symlink path for SSH agent forwarding for a named session.
+pub fn agent_link_path(name: &str) -> PathBuf {
+    socket_dir().join(format!("{name}.agent.sock"))
+}
+
+/// Atomically update the stable agent symlink to point to the current
+/// `SSH_AUTH_SOCK`. Returns `Ok(true)` if updated, `Ok(false)` if no agent
+/// is available (env var unset or target missing). Skips self-referencing
+/// symlinks to avoid loops when running mux inside mux.
+pub fn update_agent_link(name: &str) -> Result<bool> {
+    let real_sock = match std::env::var("SSH_AUTH_SOCK") {
+        Ok(val) if !val.is_empty() => PathBuf::from(val),
+        _ => return Ok(false),
+    };
+
+    // Skip if the current SSH_AUTH_SOCK already points to our own stable
+    // symlink (nested mux).
+    let link = agent_link_path(name);
+    if real_sock == link {
+        debug!("skipping self-referencing agent symlink for session {name}");
+        return Ok(false);
+    }
+
+    // Verify the real socket exists
+    if !real_sock.exists() {
+        debug!(?real_sock, "SSH_AUTH_SOCK target does not exist, skipping");
+        return Ok(false);
+    }
+
+    // Atomic update: create temp symlink then rename over the stable path
+    let pid = std::process::id();
+    let tmp = socket_dir().join(format!("{name}.agent.sock.tmp.{pid}"));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&real_sock, &tmp)
+        .with_context(|| format!("failed to create temp agent symlink at {}", tmp.display()))?;
+    fs::rename(&tmp, &link)
+        .with_context(|| format!("failed to rename agent symlink to {}", link.display()))?;
+
+    debug!(?link, ?real_sock, "updated agent symlink for session {name}");
+    Ok(true)
+}
+
+/// Best-effort removal of the stable agent symlink for a session.
+pub fn remove_agent_link(name: &str) {
+    let link = agent_link_path(name);
+    let _ = fs::remove_file(&link);
 }
 
 /// Verify that a directory is owned by the current user and has mode 0o700.

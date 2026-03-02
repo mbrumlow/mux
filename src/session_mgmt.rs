@@ -28,6 +28,11 @@ pub fn list_sessions() -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("???");
 
+        // Skip agent symlinks (e.g. "mysession.agent.sock")
+        if name.ends_with(".agent") {
+            continue;
+        }
+
         if UnixStream::connect(&path).is_ok() {
             println!("{name}");
             found = true;
@@ -66,10 +71,11 @@ pub fn kill_session(name: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Clean up socket and lock files
+    // Clean up socket, lock, and agent symlink
     let _ = std::fs::remove_file(&sock);
     let lock_path = paths::socket_dir().join(format!("{name}.lock"));
     let _ = std::fs::remove_file(lock_path);
+    paths::remove_agent_link(name);
 
     eprintln!("killed session '{name}'");
     Ok(())
@@ -78,6 +84,10 @@ pub fn kill_session(name: &str) -> Result<()> {
 /// Attach to a named session (starting the server if needed).
 pub fn attach(name: &str, program: &[String]) -> Result<()> {
     paths::validate_session_name(name)?;
+
+    // Update SSH agent symlink so the PTY (or an existing session) can
+    // reach the caller's current SSH agent.
+    let _ = paths::update_agent_link(name);
 
     daemon::ensure_server(name, program, None)?;
 
