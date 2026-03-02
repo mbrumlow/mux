@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -22,6 +22,9 @@ struct ClientConn {
     msg_rx: mpsc::Receiver<C2S>,
     _read_task: tokio::task::JoinHandle<()>,
 }
+
+/// Maximum number of kicked clients kept in the waiting queue.
+const MAX_WAITING_CLIENTS: usize = 8;
 
 /// A kicked client that is still connected and waiting to reclaim.
 struct WaitingClient {
@@ -73,36 +76,72 @@ async fn notify_session_ended(
     }
 }
 
-/// A clonable writer wrapper so both session and wezterm-term can write to the PTY.
-struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
+/// Channel-backed writer that offloads blocking PTY writes to a dedicated thread.
+/// Both the session loop and wezterm-term can clone and write without blocking
+/// the tokio runtime.
+struct ChannelWriter {
+    tx: std::sync::mpsc::SyncSender<WriterMsg>,
+}
 
-impl SharedWriter {
-    fn new(writer: Box<dyn Write + Send>) -> Self {
-        Self(Arc::new(Mutex::new(writer)))
+enum WriterMsg {
+    Data(Vec<u8>),
+    Flush,
+}
+
+impl ChannelWriter {
+    /// Spawn a dedicated writer thread and return a ChannelWriter.
+    fn spawn(mut inner: Box<dyn Write + Send>) -> Self {
+        // Bounded channel provides backpressure without unbounded memory growth.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(256);
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    WriterMsg::Data(data) => {
+                        if inner.write_all(&data).is_err() {
+                            break;
+                        }
+                    }
+                    WriterMsg::Flush => {
+                        if inner.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
     }
 
     fn clone_boxed(&self) -> Box<dyn Write + Send> {
-        Box::new(SharedWriter(Arc::clone(&self.0)))
+        Box::new(ChannelWriter {
+            tx: self.tx.clone(),
+        })
     }
 }
 
-impl Write for SharedWriter {
+impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
+        let len = buf.len();
+        self.tx
+            .send(WriterMsg::Data(buf.to_vec()))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))?;
+        Ok(len)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
+        self.tx
+            .send(WriterMsg::Flush)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))
     }
 }
 
 pub struct Session {
     name: String,
     pty: PtyHandle,
-    pty_writer: SharedWriter,
+    pty_writer: ChannelWriter,
     terminal: Terminal,
     listener: Listener,
-    pty_rx: mpsc::Receiver<Vec<u8>>,
+    pty_rx: mpsc::Receiver<Box<[u8]>>,
 }
 
 impl Session {
@@ -115,13 +154,13 @@ impl Session {
         extra_env: &[(String, String)],
     ) -> Result<Self> {
         let (pty, pty_reader, pty_writer) = PtyHandle::spawn(rows, cols, program, name, extra_env)?;
-        let shared = SharedWriter::new(pty_writer);
-        let term_writer = shared.clone_boxed();
+        let channel_writer = ChannelWriter::spawn(pty_writer);
+        let term_writer = channel_writer.clone_boxed();
         let terminal = Terminal::new(rows, cols, term_writer);
         let listener = Listener::bind(sock_path)?;
 
         // Spawn blocking reader for PTY output
-        let (pty_tx, pty_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (pty_tx, pty_rx) = mpsc::channel::<Box<[u8]>>(256);
         std::thread::spawn(move || {
             read_pty_loop(pty_reader, pty_tx);
         });
@@ -129,7 +168,7 @@ impl Session {
         Ok(Self {
             name: name.to_string(),
             pty,
-            pty_writer: shared,
+            pty_writer: channel_writer,
             terminal,
             listener,
             pty_rx,
@@ -381,13 +420,14 @@ impl Session {
 
                 // ── Periodic full-screen refresh (repairs screen corruption) ──
                 _ = refresh_interval.tick(), if client.is_some() && !dirty => {
-                    self.terminal.invalidate_prev_frame();
-                    if let Some(data) = self.terminal.screen_diff() {
-                        let conn = client.as_mut().unwrap();
-                        if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
-                            warn!("failed to send refresh, dropping client: {e}");
-                            drop(client.take());
-                            notify_next_waiting(&mut waiting).await;
+                    if self.terminal.refresh_if_changed() {
+                        if let Some(data) = self.terminal.screen_diff() {
+                            let conn = client.as_mut().unwrap();
+                            if let Err(e) = write_frame_async(&mut conn.writer, &S2C::ScreenDiff { data }).await {
+                                warn!("failed to send refresh, dropping client: {e}");
+                                drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
+                            }
                         }
                     }
                 }
@@ -403,6 +443,10 @@ impl Session {
                                             &mut old.writer,
                                             &S2C::Kicked { reason: "another client connected".to_string() },
                                         ).await;
+                                        // Evict oldest waiting client if at capacity
+                                        while waiting.len() >= MAX_WAITING_CLIENTS {
+                                            waiting.pop_front();
+                                        }
                                         waiting.push_back(kick_to_waiting(old));
                                     }
                                     client = Some(conn);
@@ -541,8 +585,8 @@ impl Session {
     }
 }
 
-fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
-    let mut buf = [0u8; 16384];
+fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Box<[u8]>>) {
+    let mut buf = [0u8; 32768];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -550,7 +594,7 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
                 break;
             }
             Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                if tx.blocking_send(buf[..n].into()).is_err() {
                     break;
                 }
             }

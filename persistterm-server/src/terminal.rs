@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -63,6 +63,8 @@ pub struct Terminal {
     /// Whether the application has an active synchronized update (DEC mode 2026).
     app_sync_active: bool,
     size: (u16, u16),
+    /// Hash of the last refresh-check screen, to avoid resending identical screens.
+    last_refresh_hash: u64,
 }
 
 impl Terminal {
@@ -91,6 +93,7 @@ impl Terminal {
             prev_frame: None,
             app_sync_active: false,
             size: (rows, cols),
+            last_refresh_hash: 0,
         }
     }
 
@@ -460,6 +463,20 @@ impl Terminal {
         self.prev_frame = None;
     }
 
+    /// Check if the screen has changed since the last refresh. If so,
+    /// invalidate the previous frame so `screen_diff()` produces a full
+    /// repaint. Returns true if a refresh is needed.
+    pub fn refresh_if_changed(&mut self) -> bool {
+        let data = self.screen_formatted();
+        let hash = simple_hash(&data);
+        if hash == self.last_refresh_hash {
+            return false;
+        }
+        self.last_refresh_hash = hash;
+        self.prev_frame = None;
+        true
+    }
+
     /// Reset the previous screen to the current state.
     pub fn reset_prev_screen(&mut self) {
         let (rows, cols) = (self.size.0 as usize, self.size.1 as usize);
@@ -518,6 +535,13 @@ fn detect_scroll(
         return None;
     }
 
+    // Build lookup from stable ID → previous row index for O(1) per-row lookup.
+    let prev_index: HashMap<StableRowIndex, usize> = prev_stable
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, i))
+        .collect();
+
     // For each current row, find where its stable ID was in the previous frame.
     // Compute the shift (prev_pos - cur_pos) for each. The dominant non-zero
     // shift across a contiguous region is our scroll.
@@ -526,8 +550,7 @@ fn detect_scroll(
 
     for cur_row in 0..rows {
         let stable = cur_stable[cur_row];
-        // Look for this stable ID in the previous frame
-        if let Some(prev_row) = prev_stable.iter().position(|&s| s == stable) {
+        if let Some(&prev_row) = prev_index.get(&stable) {
             let s = prev_row as isize - cur_row as isize;
             if s != 0 {
                 shifts[cur_row] = s;
@@ -957,4 +980,14 @@ fn scan_pty_output(
 
         i += 1;
     }
+}
+
+/// FNV-1a hash for fast screen content comparison.
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }

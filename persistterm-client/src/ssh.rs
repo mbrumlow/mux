@@ -131,6 +131,11 @@ pub async fn connect(
         .await
         .context("failed to open SSH session channel")?;
     let mux_bin = std::env::var("MUX_REMOTE_BIN").unwrap_or_else(|_| "mux".to_string());
+    // Validate MUX_REMOTE_BIN to prevent command injection on the remote host.
+    // Allow only path-like characters: alphanumeric, '/', '-', '_', '.'
+    if !mux_bin.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')) {
+        bail!("MUX_REMOTE_BIN contains invalid characters: {mux_bin:?}");
+    }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let command = format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
     channel

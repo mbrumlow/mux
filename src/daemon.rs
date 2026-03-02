@@ -84,7 +84,9 @@ pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, 
     // Detach from terminal via setsid
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

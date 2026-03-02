@@ -27,6 +27,73 @@ enum ExitReason {
     SessionEnded,
 }
 
+/// Result of processing a single server message.
+enum MsgAction {
+    Continue,
+    Exit(ExitReason),
+}
+
+/// Process a single S2C message, writing any terminal output to `stdout`.
+/// Returns `MsgAction::Exit` if the session should end.
+fn handle_server_msg(
+    msg: S2C,
+    stdout: &mut std::io::Stdout,
+    local_kkp_active: &mut bool,
+    local_dec_modes: &mut std::collections::HashSet<u16>,
+    last_pong: &mut Instant,
+) -> std::io::Result<MsgAction> {
+    match msg {
+        S2C::Snapshot(snapshot) => {
+            render::render_snapshot(stdout, &snapshot)?;
+        }
+        S2C::ScreenData { data } => {
+            stdout.write_all(b"\x1b[?2026h")?;
+            stdout.write_all(&data)?;
+            stdout.write_all(b"\x1b[?2026l")?;
+        }
+        S2C::ScreenDiff { data } => {
+            stdout.write_all(&data)?;
+        }
+        S2C::SetKkpMode { flags } => {
+            if flags > 0 {
+                if *local_kkp_active {
+                    write!(stdout, "\x1b[<u")?;
+                }
+                write!(stdout, "\x1b[>{flags}u")?;
+                *local_kkp_active = true;
+            } else if *local_kkp_active {
+                write!(stdout, "\x1b[<u")?;
+                *local_kkp_active = false;
+            }
+        }
+        S2C::SetDecMode { mode, enabled } => {
+            if enabled {
+                write!(stdout, "\x1b[?{mode}h")?;
+                local_dec_modes.insert(mode);
+            } else {
+                write!(stdout, "\x1b[?{mode}l")?;
+                local_dec_modes.remove(&mode);
+            }
+        }
+        S2C::Clipboard { params, data } => {
+            write!(stdout, "\x1b]52;{params};{data}\x07")?;
+        }
+        S2C::Kicked { reason } => {
+            info!("kicked: {reason}");
+            return Ok(MsgAction::Exit(ExitReason::Kicked(reason)));
+        }
+        S2C::SessionEnded => {
+            info!("session ended");
+            return Ok(MsgAction::Exit(ExitReason::SessionEnded));
+        }
+        S2C::Pong { .. } => {
+            *last_pong = Instant::now();
+        }
+        _ => {}
+    }
+    Ok(MsgAction::Continue)
+}
+
 /// Clean up KKP and DEC modes on the local terminal.
 fn cleanup_terminal_modes(
     stdout: &mut std::io::Stdout,
@@ -185,55 +252,16 @@ async fn run_session(
                     }
                 } => {
                     match msg {
-                        Some(S2C::Snapshot(snapshot)) => {
-                            render::render_snapshot(&mut stdout, &snapshot)?;
-                        }
-                        Some(S2C::ScreenData { data }) => {
-                            stdout.write_all(b"\x1b[?2026h\x1b[2J\x1b[H")?;
-                            stdout.write_all(&data)?;
-                            stdout.write_all(b"\x1b[?2026l")?;
-                        }
-                        Some(S2C::ScreenDiff { data }) => {
-                            stdout.write_all(&data)?;
-                        }
-                        Some(S2C::SetKkpMode { flags }) => {
-                            if flags > 0 {
-                                if local_kkp_active {
-                                    write!(stdout, "\x1b[<u")?;
-                                }
-                                write!(stdout, "\x1b[>{flags}u")?;
-                                local_kkp_active = true;
-                            } else if local_kkp_active {
-                                write!(stdout, "\x1b[<u")?;
-                                local_kkp_active = false;
+                        Some(msg) => {
+                            if let MsgAction::Exit(reason) = handle_server_msg(
+                                msg, &mut stdout, &mut local_kkp_active,
+                                &mut local_dec_modes, &mut last_pong,
+                            )? {
+                                exit_reason = reason;
+                                stdout.flush()?;
+                                break;
                             }
                         }
-                        Some(S2C::SetDecMode { mode, enabled }) => {
-                            if enabled {
-                                write!(stdout, "\x1b[?{mode}h")?;
-                                local_dec_modes.insert(mode);
-                            } else {
-                                write!(stdout, "\x1b[?{mode}l")?;
-                                local_dec_modes.remove(&mode);
-                            }
-                        }
-                        Some(S2C::Clipboard { params, data }) => {
-                            write!(stdout, "\x1b]52;{params};{data}\x07")?;
-                        }
-                        Some(S2C::Kicked { reason }) => {
-                            info!("kicked: {reason}");
-                            exit_reason = ExitReason::Kicked(reason);
-                            break;
-                        }
-                        Some(S2C::SessionEnded) => {
-                            info!("session ended");
-                            exit_reason = ExitReason::SessionEnded;
-                            break;
-                        }
-                        Some(S2C::Pong { .. }) => {
-                            last_pong = Instant::now();
-                        }
-                        Some(_) => {}
                         None => {
                             info!("server disconnected");
                             exit_reason = ExitReason::ServerDisconnected;
@@ -243,60 +271,19 @@ async fn run_session(
                     // Drain queued server messages before flushing so
                     // multiple updates (e.g. DEC mode + diff) are written
                     // to the terminal in a single flush.
-                    while let Some(rx) = server_rx.as_mut() {
-                        match rx.try_recv() {
-                            Ok(S2C::Snapshot(snapshot)) => {
-                                render::render_snapshot(&mut stdout, &snapshot)?;
-                            }
-                            Ok(S2C::ScreenData { data }) => {
-                                stdout.write_all(b"\x1b[?2026h\x1b[2J\x1b[H")?;
-                                stdout.write_all(&data)?;
-                                stdout.write_all(b"\x1b[?2026l")?;
-                            }
-                            Ok(S2C::ScreenDiff { data }) => {
-                                stdout.write_all(&data)?;
-                            }
-                            Ok(S2C::SetKkpMode { flags }) => {
-                                if flags > 0 {
-                                    if local_kkp_active {
-                                        write!(stdout, "\x1b[<u")?;
-                                    }
-                                    write!(stdout, "\x1b[>{flags}u")?;
-                                    local_kkp_active = true;
-                                } else if local_kkp_active {
-                                    write!(stdout, "\x1b[<u")?;
-                                    local_kkp_active = false;
-                                }
-                            }
-                            Ok(S2C::SetDecMode { mode, enabled }) => {
-                                if enabled {
-                                    write!(stdout, "\x1b[?{mode}h")?;
-                                    local_dec_modes.insert(mode);
-                                } else {
-                                    write!(stdout, "\x1b[?{mode}l")?;
-                                    local_dec_modes.remove(&mode);
-                                }
-                            }
-                            Ok(S2C::Clipboard { params, data }) => {
-                                write!(stdout, "\x1b]52;{params};{data}\x07")?;
-                            }
-                            Ok(S2C::Kicked { reason }) => {
-                                info!("kicked: {reason}");
-                                exit_reason = ExitReason::Kicked(reason);
+                    if let Some(rx) = server_rx.as_mut() {
+                        while let Ok(msg) = rx.try_recv() {
+                            if let MsgAction::Exit(reason) = handle_server_msg(
+                                msg, &mut stdout, &mut local_kkp_active,
+                                &mut local_dec_modes, &mut last_pong,
+                            )? {
+                                exit_reason = reason;
                                 stdout.flush()?;
                                 break;
                             }
-                            Ok(S2C::SessionEnded) => {
-                                info!("session ended");
-                                exit_reason = ExitReason::SessionEnded;
-                                stdout.flush()?;
-                                break;
-                            }
-                            Ok(S2C::Pong { .. }) => {
-                                last_pong = Instant::now();
-                            }
-                            Ok(_) => {}
-                            Err(_) => break,
+                        }
+                        if matches!(exit_reason, ExitReason::Kicked(_) | ExitReason::SessionEnded) {
+                            break;
                         }
                     }
                     stdout.flush()?;
@@ -543,14 +530,14 @@ async fn show_reconnect_overlay(
                 }
             }
             _ = interval.tick() => {
-                if remaining == 0 {
-                    return ReconnectAction::Retry;
-                }
-                remaining -= 1;
+                remaining = remaining.saturating_sub(1);
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let _ = render::render_reconnect_overlay(
                     &mut stdout, cols, rows, host, session, attempt, remaining,
                 );
+                if remaining == 0 {
+                    return ReconnectAction::Retry;
+                }
             }
         }
     }

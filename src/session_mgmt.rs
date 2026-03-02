@@ -66,8 +66,10 @@ pub fn kill_session(name: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Clean up socket file
+    // Clean up socket and lock files
     let _ = std::fs::remove_file(&sock);
+    let lock_path = paths::socket_dir().join(format!("{name}.lock"));
+    let _ = std::fs::remove_file(lock_path);
 
     eprintln!("killed session '{name}'");
     Ok(())

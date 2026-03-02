@@ -30,5 +30,8 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // Clean up the advisory lock file alongside the socket
+        let lock_path = self.path.with_extension("lock");
+        let _ = std::fs::remove_file(lock_path);
     }
 }
