@@ -425,15 +425,18 @@ impl Session {
     /// After resizing the PTY, drain output briefly so the child process
     /// can re-render at the new size before we capture the screen.
     async fn drain_pty_after_resize(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut got_data = false;
 
         loop {
             let timeout = if got_data {
-                // After receiving data, use a short quiescence timeout
-                (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline)
+                // After receiving data, wait for the app to finish its full
+                // redraw — complex apps (emacs, btop) redraw in multiple
+                // bursts with gaps between them.
+                (tokio::time::Instant::now() + Duration::from_millis(50)).min(deadline)
             } else {
-                deadline
+                // Wait up to 100ms for the child to start responding to SIGWINCH
+                (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline)
             };
 
             tokio::select! {
