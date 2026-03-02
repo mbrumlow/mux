@@ -94,16 +94,6 @@ async fn run_session(
         let _ = stdout.flush();
     }
 
-    // Send initial resize
-    write_frame_async(
-        &mut writer,
-        &C2S::Resize {
-            width: cols,
-            height: rows,
-        },
-    )
-    .await?;
-
     // Spawn task to read server messages
     let (server_tx, server_rx) = mpsc::channel::<S2C>(64);
     tokio::spawn(async move {
