@@ -2,6 +2,7 @@ const PREFIX_RAW: u8 = 0x1C; // Ctrl+backslash as raw byte
 const DETACH_RAW: u8 = b'd';
 const KILL_RAW: u8 = b'k';
 const REFRESH_RAW: u8 = b'r';
+const INFO_RAW: u8 = b'i';
 const ESC: u8 = 0x1b;
 const MAX_SEQ_LEN: usize = 64;
 
@@ -10,12 +11,14 @@ const KKP_BACKSLASH: u32 = 92;
 const KKP_D: u32 = 100;
 const KKP_K: u32 = 107;
 const KKP_R: u32 = 114;
+const KKP_I: u32 = 105;
 
 pub struct FilterResult {
     pub forward: Vec<u8>,
     pub detach: bool,
     pub kill: bool,
     pub refresh: bool,
+    pub info: bool,
 }
 
 enum State {
@@ -63,6 +66,10 @@ fn is_plain_k(keycode: u32, modifiers: u32) -> bool {
 
 fn is_plain_r(keycode: u32, modifiers: u32) -> bool {
     keycode == KKP_R && modifiers == 1
+}
+
+fn is_plain_i(keycode: u32, modifiers: u32) -> bool {
+    keycode == KKP_I && modifiers == 1
 }
 
 /// True for bytes that are CSI parameter characters (digits, ; :)
@@ -165,6 +172,7 @@ impl DetachFilter {
                             detach: true,
                             kill: false,
                             refresh: false,
+                            info: false,
                         };
                     } else if b == KILL_RAW {
                         self.state = State::Normal;
@@ -173,6 +181,7 @@ impl DetachFilter {
                             detach: false,
                             kill: true,
                             refresh: false,
+                            info: false,
                         };
                     } else if b == REFRESH_RAW {
                         self.state = State::Normal;
@@ -181,6 +190,16 @@ impl DetachFilter {
                             detach: false,
                             kill: false,
                             refresh: true,
+                            info: false,
+                        };
+                    } else if b == INFO_RAW {
+                        self.state = State::Normal;
+                        return FilterResult {
+                            forward,
+                            detach: false,
+                            kill: false,
+                            refresh: false,
+                            info: true,
                         };
                     } else if b == PREFIX_RAW {
                         // Raw escape: forward one literal 0x1C
@@ -225,6 +244,7 @@ impl DetachFilter {
                                     detach: true,
                                     kill: false,
                                     refresh: false,
+                                    info: false,
                                 };
                             } else if is_plain_k(kc, mods) {
                                 self.seq_buf.clear();
@@ -234,6 +254,7 @@ impl DetachFilter {
                                     detach: false,
                                     kill: true,
                                     refresh: false,
+                                    info: false,
                                 };
                             } else if is_plain_r(kc, mods) {
                                 self.seq_buf.clear();
@@ -243,6 +264,17 @@ impl DetachFilter {
                                     detach: false,
                                     kill: false,
                                     refresh: true,
+                                    info: false,
+                                };
+                            } else if is_plain_i(kc, mods) {
+                                self.seq_buf.clear();
+                                self.state = State::Normal;
+                                return FilterResult {
+                                    forward,
+                                    detach: false,
+                                    kill: false,
+                                    refresh: false,
+                                    info: true,
                                 };
                             } else if is_ctrl_backslash(kc, mods) {
                                 // KKP escape: forward one KKP Ctrl+\ sequence
@@ -275,6 +307,7 @@ impl DetachFilter {
             detach: false,
             kill: false,
             refresh: false,
+            info: false,
         }
     }
 }
@@ -549,5 +582,65 @@ mod tests {
         let r = f.feed(&[PREFIX_RAW, KILL_RAW]);
         assert!(!r.detach);
         assert!(r.kill);
+    }
+
+    // ── Info (C-\ i) tests ──────────────────────────────────────
+
+    #[test]
+    fn raw_info() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[PREFIX_RAW, INFO_RAW]);
+        assert!(r.forward.is_empty());
+        assert!(r.info);
+        assert!(!r.detach);
+        assert!(!r.kill);
+        assert!(!r.refresh);
+    }
+
+    #[test]
+    fn raw_info_mid_chunk() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(&[b'a', b'b', PREFIX_RAW, INFO_RAW, b'c']);
+        assert_eq!(r.forward, b"ab");
+        assert!(r.info);
+    }
+
+    // 'i' in KKP: ESC [ 105 ; 1 u
+    const KKP_I_KEY: &[u8] = b"\x1b[105;1u";
+    // 'i' in KKP with no modifier field: ESC [ 105 u
+    const KKP_I_BARE: &[u8] = b"\x1b[105u";
+
+    #[test]
+    fn kkp_info() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.extend_from_slice(KKP_I_KEY);
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(r.info);
+        assert!(!r.detach);
+    }
+
+    #[test]
+    fn kkp_info_bare_i() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.extend_from_slice(KKP_I_BARE);
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(r.info);
+    }
+
+    #[test]
+    fn kkp_info_raw_i_after_kkp_prefix() {
+        let mut f = DetachFilter::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(KKP_CTRL_BSLASH);
+        input.push(b'i');
+        let r = f.feed(&input);
+        assert!(r.forward.is_empty());
+        assert!(r.info);
     }
 }

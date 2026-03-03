@@ -16,6 +16,11 @@ use tracing::{error, info};
 use persistterm_proto::codec::async_io::{read_frame_async, write_frame_async};
 use persistterm_proto::{C2S, ClientCapabilities, S2C};
 
+const MUX_VERSION: &str = match option_env!("MUX_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Reason the client session ended.
 enum ExitReason {
     Detached,
@@ -25,10 +30,25 @@ enum ExitReason {
     SessionEnded,
 }
 
+/// Session info received from server.
+struct SessionInfoData {
+    session_name: String,
+    server_version: String,
+    program: Vec<String>,
+    uptime_secs: u64,
+    terminal_size: (u16, u16),
+    pid: u32,
+    child_pid: Option<u32>,
+    attached_secs: u64,
+    waiting_clients: usize,
+    latency_ms: Option<u64>,
+}
+
 /// Result of processing a single server message.
 enum MsgAction {
     Continue,
     Exit(ExitReason),
+    ShowInfo(SessionInfoData),
 }
 
 /// Process a single S2C message, writing any terminal output to `stdout`.
@@ -39,6 +59,7 @@ fn handle_server_msg(
     local_kkp_active: &mut bool,
     local_dec_modes: &mut std::collections::HashSet<u16>,
     last_pong: &mut Instant,
+    last_rtt_ms: &mut Option<u64>,
 ) -> std::io::Result<MsgAction> {
     match msg {
         S2C::Snapshot(snapshot) => {
@@ -84,8 +105,37 @@ fn handle_server_msg(
             info!("session ended");
             return Ok(MsgAction::Exit(ExitReason::SessionEnded));
         }
-        S2C::Pong { .. } => {
+        S2C::SessionInfo {
+            session_name,
+            server_version,
+            program,
+            uptime_secs,
+            terminal_size,
+            pid,
+            child_pid,
+            attached_secs,
+            waiting_clients,
+        } => {
+            return Ok(MsgAction::ShowInfo(SessionInfoData {
+                session_name,
+                server_version,
+                program,
+                uptime_secs,
+                terminal_size,
+                pid,
+                child_pid,
+                attached_secs,
+                waiting_clients,
+                latency_ms: *last_rtt_ms,
+            }));
+        }
+        S2C::Pong { t } => {
             *last_pong = Instant::now();
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            *last_rtt_ms = Some(now_ms.saturating_sub(t));
         }
         _ => {}
     }
@@ -195,6 +245,7 @@ async fn run_session(
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(5));
     keepalive_interval.tick().await; // consume initial tick
     let mut last_pong = Instant::now();
+    let mut last_rtt_ms: Option<u64> = None;
 
     let result: Result<()> = async {
         loop {
@@ -219,6 +270,9 @@ async fn run_session(
                     }
                     if result.refresh {
                         write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
+                    }
+                    if result.info {
+                        write_frame_async(&mut writer, &C2S::RequestSessionInfo).await?;
                     }
                 }
 
@@ -251,13 +305,38 @@ async fn run_session(
                 } => {
                     match msg {
                         Some(msg) => {
-                            if let MsgAction::Exit(reason) = handle_server_msg(
+                            match handle_server_msg(
                                 msg, &mut stdout, &mut local_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
+                                &mut last_rtt_ms,
                             )? {
-                                exit_reason = reason;
-                                stdout.flush()?;
-                                break;
+                                MsgAction::Exit(reason) => {
+                                    exit_reason = reason;
+                                    stdout.flush()?;
+                                    break;
+                                }
+                                MsgAction::ShowInfo(info) => {
+                                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    render::render_session_info_overlay(
+                                        &mut stdout, cols, rows,
+                                        &info.session_name,
+                                        &info.server_version,
+                                        MUX_VERSION,
+                                        &info.program,
+                                        info.uptime_secs,
+                                        info.terminal_size,
+                                        info.pid,
+                                        info.child_pid,
+                                        info.attached_secs,
+                                        info.waiting_clients,
+                                        info.latency_ms,
+                                    )?;
+                                    // Wait for any key to dismiss
+                                    stdin_rx.recv().await;
+                                    // Restore session screen
+                                    write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
+                                }
+                                MsgAction::Continue => {}
                             }
                         }
                         None => {
@@ -271,13 +350,21 @@ async fn run_session(
                     // to the terminal in a single flush.
                     if let Some(rx) = server_rx.as_mut() {
                         while let Ok(msg) = rx.try_recv() {
-                            if let MsgAction::Exit(reason) = handle_server_msg(
+                            match handle_server_msg(
                                 msg, &mut stdout, &mut local_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
+                                &mut last_rtt_ms,
                             )? {
-                                exit_reason = reason;
-                                stdout.flush()?;
-                                break;
+                                MsgAction::Exit(reason) => {
+                                    exit_reason = reason;
+                                    stdout.flush()?;
+                                    break;
+                                }
+                                MsgAction::ShowInfo(_) => {
+                                    // Info during drain — ignore (user already
+                                    // got the response in the main handler)
+                                }
+                                MsgAction::Continue => {}
                             }
                         }
                         if matches!(exit_reason, ExitReason::Kicked(_) | ExitReason::SessionEnded) {

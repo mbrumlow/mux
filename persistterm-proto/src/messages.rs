@@ -21,6 +21,7 @@ pub enum C2S {
     Resize { width: u16, height: u16 },
     Ping { t: u64 },
     RequestSnapshot,
+    RequestSessionInfo,
     KillSession,
 }
 
@@ -36,6 +37,20 @@ pub enum S2C {
     Clipboard { params: String, data: String },
     ScreenData { data: Vec<u8> },
     ScreenDiff { data: Vec<u8> },
+    SessionInfo {
+        session_name: String,
+        server_version: String,
+        program: Vec<String>,
+        uptime_secs: u64,
+        terminal_size: (u16, u16),
+        pid: u32,
+        #[serde(default)]
+        child_pid: Option<u32>,
+        #[serde(default)]
+        attached_secs: u64,
+        #[serde(default)]
+        waiting_clients: usize,
+    },
     SessionAvailable,
     SessionEnded,
 }

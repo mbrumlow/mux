@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -16,11 +16,17 @@ use crate::net::Listener;
 use crate::pty::PtyHandle;
 use crate::terminal::Terminal;
 
+const MUX_VERSION: &str = match option_env!("MUX_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Active client connection state.
 struct ClientConn {
     writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
     msg_rx: mpsc::Receiver<C2S>,
     _read_task: tokio::task::JoinHandle<()>,
+    connected_at: Instant,
 }
 
 /// Maximum number of kicked clients kept in the waiting queue.
@@ -34,7 +40,7 @@ struct WaitingClient {
 
 /// Convert a kicked ClientConn into a WaitingClient, keeping the socket alive.
 fn kick_to_waiting(conn: ClientConn) -> WaitingClient {
-    let ClientConn { writer, mut msg_rx, _read_task } = conn;
+    let ClientConn { writer, mut msg_rx, _read_task, connected_at: _ } = conn;
     let dead = Arc::new(AtomicBool::new(false));
     let dead_clone = dead.clone();
     tokio::spawn(async move {
@@ -142,6 +148,8 @@ pub struct Session {
     terminal: Terminal,
     listener: Listener,
     pty_rx: mpsc::Receiver<Box<[u8]>>,
+    started_at: Instant,
+    program: Vec<String>,
 }
 
 impl Session {
@@ -172,6 +180,8 @@ impl Session {
             terminal,
             listener,
             pty_rx,
+            started_at: Instant::now(),
+            program: program.to_vec(),
         })
     }
 
@@ -271,6 +281,26 @@ impl Session {
                             } else {
                                 self.terminal.reset_prev_screen();
                                 dirty = false;
+                            }
+                        }
+                        Some(C2S::RequestSessionInfo) => {
+                            let conn = client.as_mut().unwrap();
+                            let (rows, cols) = self.terminal.size();
+                            let info = S2C::SessionInfo {
+                                session_name: self.name.clone(),
+                                server_version: MUX_VERSION.to_string(),
+                                program: self.program.clone(),
+                                uptime_secs: self.started_at.elapsed().as_secs(),
+                                terminal_size: (cols, rows),
+                                pid: std::process::id(),
+                                child_pid: self.pty.child_pid(),
+                                attached_secs: conn.connected_at.elapsed().as_secs(),
+                                waiting_clients: waiting.iter().filter(|w| !w.dead.load(Ordering::Relaxed)).count(),
+                            };
+                            if let Err(e) = write_frame_async(&mut conn.writer, &info).await {
+                                warn!("failed to send session info, dropping client: {e}");
+                                drop(client.take());
+                                notify_next_waiting(&mut waiting).await;
                             }
                         }
                         Some(_) => {}
@@ -581,6 +611,7 @@ impl Session {
             writer,
             msg_rx,
             _read_task: read_task,
+            connected_at: Instant::now(),
         })
     }
 }

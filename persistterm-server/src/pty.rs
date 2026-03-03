@@ -6,6 +6,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_pid: Option<u32>,
 }
 
 impl PtyHandle {
@@ -45,15 +46,22 @@ impl PtyHandle {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
+        let child_pid = child.process_id();
+
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
         let handle = PtyHandle {
             master: pair.master,
             _child: child,
+            child_pid,
         };
 
         Ok((handle, reader, writer))
+    }
+
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
