@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 use crate::config::Config;
@@ -144,6 +145,11 @@ pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, 
                 r.context("bridge: socket → stdout copy failed")?;
             }
         }
+
+        // Flush stdout so final protocol messages (e.g. SessionEnded) reach
+        // sshd before the bridge process exits. tokio::io::copy does not
+        // flush on completion, leaving data in std::io::Stdout's BufWriter.
+        let _ = stdout.flush().await;
 
         Ok(())
     })
