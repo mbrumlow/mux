@@ -3,6 +3,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use tattoy_termwiz::color::ColorAttribute;
+use tattoy_termwiz::input::KeyboardEncoding;
 use tattoy_termwiz::surface::CursorVisibility;
 use tattoy_wezterm_term::color::ColorPalette;
 use tattoy_wezterm_term::{StableRowIndex, TerminalConfiguration, TerminalSize};
@@ -54,7 +55,7 @@ struct PrevFrame {
 
 pub struct Terminal {
     inner: tattoy_wezterm_term::Terminal,
-    kkp_stack: Vec<u32>,
+    last_kkp_flags: u32,
     dec_modes: BTreeSet<u16>,
     /// Buffer for OSC sequences that span multiple PTY read chunks.
     pending_osc: Vec<u8>,
@@ -87,7 +88,7 @@ impl Terminal {
 
         Self {
             inner,
-            kkp_stack: Vec::new(),
+            last_kkp_flags: 0,
             dec_modes: BTreeSet::new(),
             pending_osc: Vec::new(),
             prev_frame: None,
@@ -99,14 +100,13 @@ impl Terminal {
 
     /// Process PTY output bytes. Returns events that need handling.
     pub fn process(&mut self, data: &[u8]) -> PtyEvents {
-        let old_kkp = self.kkp_flags();
+        let old_kkp = self.last_kkp_flags;
 
-        // Scan for KKP/DEC/OSC changes (detection only)
+        // Scan for DEC/OSC changes (still needed — wezterm-term doesn't expose these)
         let mut client_forwards = Vec::new();
         let mut dec_mode_changes = Vec::new();
         scan_pty_output(
             data,
-            &mut self.kkp_stack,
             &mut self.dec_modes,
             &mut dec_mode_changes,
             &mut client_forwards,
@@ -117,7 +117,13 @@ impl Terminal {
         // wezterm-term handles ALL VT emulation and query responses
         self.inner.advance_bytes(data);
 
-        let new_kkp = self.kkp_flags();
+        // Get authoritative KKP state from wezterm-term
+        let new_kkp = match self.inner.get_keyboard_encoding() {
+            KeyboardEncoding::Kitty(flags) => flags.bits() as u32,
+            _ => 0,
+        };
+        self.last_kkp_flags = new_kkp;
+
         PtyEvents {
             kkp_changed: if old_kkp != new_kkp {
                 Some(new_kkp)
@@ -140,7 +146,7 @@ impl Terminal {
 
     /// Current KKP flags (0 = disabled / legacy mode).
     pub fn kkp_flags(&self) -> u32 {
-        self.kkp_stack.last().copied().unwrap_or(0)
+        self.last_kkp_flags
     }
 
     /// Whether the application has an active synchronized update (DEC 2026).
@@ -798,10 +804,10 @@ fn handle_osc(body: &[u8], client_forwards: &mut Vec<Vec<u8>>) {
     }
 }
 
-/// Scan PTY output for KKP sequences, DEC private mode changes, and OSC clipboard.
+/// Scan PTY output for DEC private mode changes and OSC clipboard.
+/// KKP tracking is handled by wezterm-term's authoritative state.
 fn scan_pty_output(
     data: &[u8],
-    kkp_stack: &mut Vec<u32>,
     dec_modes: &mut BTreeSet<u16>,
     dec_mode_changes: &mut Vec<(u16, bool)>,
     client_forwards: &mut Vec<Vec<u8>>,
@@ -878,84 +884,6 @@ fn scan_pty_output(
                                 }
                             }
                         }
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-
-            if data[i + 2] == b'>' {
-                let mut j = i + 3;
-                let param_start = j;
-                while j < data.len() && data[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < data.len() && data[j] == b'u' {
-                    let flags: u32 = if j > param_start {
-                        std::str::from_utf8(&data[param_start..j])
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    kkp_stack.push(flags);
-                    i = j + 1;
-                    continue;
-                }
-            }
-
-            if data[i + 2] == b'<' {
-                let mut j = i + 3;
-                let param_start = j;
-                while j < data.len() && data[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < data.len() && data[j] == b'u' {
-                    let count: usize = if j > param_start {
-                        std::str::from_utf8(&data[param_start..j])
-                            .unwrap_or("1")
-                            .parse()
-                            .unwrap_or(1)
-                    } else {
-                        1
-                    };
-                    for _ in 0..count {
-                        kkp_stack.pop();
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-
-            if data[i + 2] == b'=' {
-                let mut j = i + 3;
-                while j < data.len() && (data[j].is_ascii_digit() || data[j] == b';') {
-                    j += 1;
-                }
-                if j < data.len() && data[j] == b'u' {
-                    let param_str =
-                        std::str::from_utf8(&data[i + 3..j]).unwrap_or("0");
-                    let mut parts = param_str.split(';');
-                    let flags: u32 = parts
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let mode: u32 = parts
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1);
-                    let current = kkp_stack.last().copied().unwrap_or(0);
-                    let new_flags = match mode {
-                        1 => flags,
-                        2 => current | flags,
-                        3 => current & !flags,
-                        _ => flags,
-                    };
-                    if kkp_stack.is_empty() {
-                        kkp_stack.push(new_flags);
-                    } else {
-                        *kkp_stack.last_mut().unwrap() = new_flags;
                     }
                     i = j + 1;
                     continue;
