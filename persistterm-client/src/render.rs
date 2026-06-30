@@ -204,29 +204,34 @@ pub fn render_reconnect_overlay<W: Write>(
     out.flush()
 }
 
+/// Fields rendered by [`render_session_info_overlay`].
+pub struct SessionInfoView<'a> {
+    pub session_name: &'a str,
+    pub server_version: &'a str,
+    pub client_version: &'a str,
+    pub program: &'a [String],
+    pub uptime_secs: u64,
+    pub terminal_size: (u16, u16),
+    pub pid: u32,
+    pub child_pid: Option<u32>,
+    pub attached_secs: u64,
+    pub waiting_clients: usize,
+    pub latency_ms: Option<u64>,
+}
+
 pub fn render_session_info_overlay<W: Write>(
     out: &mut W,
     cols: u16,
     rows: u16,
-    session_name: &str,
-    server_version: &str,
-    client_version: &str,
-    program: &[String],
-    uptime_secs: u64,
-    terminal_size: (u16, u16),
-    pid: u32,
-    child_pid: Option<u32>,
-    attached_secs: u64,
-    waiting_clients: usize,
-    latency_ms: Option<u64>,
+    info: &SessionInfoView,
 ) -> std::io::Result<()> {
     // Clear screen, reset attributes, hide cursor
     write!(out, "\x1b[0m\x1b[2J\x1b[?25l")?;
 
-    let command = if program.is_empty() {
+    let command = if info.program.is_empty() {
         "$SHELL".to_string()
     } else {
-        program.join(" ")
+        info.program.join(" ")
     };
 
     let format_duration = |total_secs: u64| -> String {
@@ -245,20 +250,20 @@ pub fn render_session_info_overlay<W: Write>(
         }
     };
 
-    let uptime = format_duration(uptime_secs);
-    let attached = format_duration(attached_secs);
+    let uptime = format_duration(info.uptime_secs);
+    let attached = format_duration(info.attached_secs);
 
-    let size_str = format!("{}x{}", terminal_size.0, terminal_size.1);
-    let server_val = format!("mux {server_version}");
-    let client_val = format!("mux {client_version}");
-    let pid_str = pid.to_string();
-    let child_pid_str = child_pid.map_or("N/A".to_string(), |p| p.to_string());
-    let waiting_str = waiting_clients.to_string();
-    let latency_str = latency_ms.map_or("N/A".to_string(), |ms| format!("{ms}ms"));
+    let size_str = format!("{}x{}", info.terminal_size.0, info.terminal_size.1);
+    let server_val = format!("mux {}", info.server_version);
+    let client_val = format!("mux {}", info.client_version);
+    let pid_str = info.pid.to_string();
+    let child_pid_str = info.child_pid.map_or("N/A".to_string(), |p| p.to_string());
+    let waiting_str = info.waiting_clients.to_string();
+    let latency_str = info.latency_ms.map_or("N/A".to_string(), |ms| format!("{ms}ms"));
 
     // Key-value pairs (without Command): right-align keys, align ':'
     let kv: &[(&str, &str)] = &[
-        ("Session", session_name),
+        ("Session", info.session_name),
         ("Server", &server_val),
         ("Client", &client_val),
         ("Uptime", &uptime),
@@ -280,7 +285,7 @@ pub fn render_session_info_overlay<W: Write>(
     let start_row = rows.saturating_sub(total as u16) / 2 + 1;
 
     // Place the ':' at the screen center. Keys go left, values go right.
-    let colon_col = (cols / 2 + 1) as u16;
+    let colon_col = cols / 2 + 1;
 
     for (i, (key, val)) in kv.iter().enumerate() {
         let row = start_row + i as u16;
@@ -296,16 +301,19 @@ pub fn render_session_info_overlay<W: Write>(
 
     // Hint line centered on screen
     let hint_row = start_row + kv.len() as u16 + 1;
-    let hint_col = (cols.saturating_sub(hint_line.len() as u16) + 1) / 2 + 1;
+    let hint_col = cols.saturating_sub(hint_line.len() as u16).div_ceil(2) + 1;
     write!(out, "\x1b[{hint_row};{hint_col}H")?;
     write!(out, "\x1b[7m{hint_line}\x1b[0m")?;
 
-    // Command at the bottom-left, truncated to screen width
+    // Command at the bottom-left, truncated to screen width.
+    // Truncate by chars (not bytes) so a multi-byte command never panics
+    // on a non-char-boundary slice when the window is narrow.
     let cmd_label = format!("Command: {command}");
-    let cmd_display = if cmd_label.len() > cols as usize {
-        &cmd_label[..cols as usize]
+    let max_cols = cols as usize;
+    let cmd_display: String = if cmd_label.chars().count() > max_cols {
+        cmd_label.chars().take(max_cols).collect()
     } else {
-        &cmd_label
+        cmd_label.clone()
     };
     write!(out, "\x1b[{rows};1H")?;
     write!(out, "\x1b[2m{cmd_display}\x1b[0m")?;

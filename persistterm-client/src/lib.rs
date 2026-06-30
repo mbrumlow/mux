@@ -172,8 +172,8 @@ async fn run_session(
     is_remote: bool,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<(ExitReason, Option<mpsc::Receiver<S2C>>)> {
-    // Get terminal size
-    let (cols, rows) = crossterm::terminal::size()?;
+    // Get terminal size (clamped so the PTY never sees a 0 dimension)
+    let (cols, rows) = terminal_size_clamped();
 
     let mut reader = reader;
     let mut writer = writer;
@@ -247,6 +247,12 @@ async fn run_session(
     let mut last_pong = Instant::now();
     let mut last_rtt_ms: Option<u64> = None;
 
+    // How long to hold an ambiguous lone-ESC (or other incomplete escape
+    // sequence) before forwarding it, so a real CSI sequence arriving in
+    // fragments still gets coalesced but a bare ESC reaches the app quickly.
+    const ESC_FLUSH: Duration = Duration::from_millis(50);
+    let mut esc_flush_deadline: Option<tokio::time::Instant> = None;
+
     let result: Result<()> = async {
         loop {
             // biased; ensures input is always forwarded before rendering output
@@ -274,11 +280,31 @@ async fn run_session(
                     if result.info {
                         write_frame_async(&mut writer, &C2S::RequestSessionInfo).await?;
                     }
+                    // Arm (or disarm) the idle-flush timer for any bytes the
+                    // filter is still holding (e.g. a lone ESC).
+                    esc_flush_deadline = detach_filter
+                        .has_pending()
+                        .then(|| tokio::time::Instant::now() + ESC_FLUSH);
+                }
+
+                // Flush a buffered incomplete escape sequence if no further
+                // input arrived in time (keeps a bare ESC responsive).
+                _ = async {
+                    match esc_flush_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    esc_flush_deadline = None;
+                    let pending = detach_filter.flush();
+                    if !pending.is_empty() {
+                        write_frame_async(&mut writer, &C2S::RawInput { data: pending }).await?;
+                    }
                 }
 
                 // Terminal resize
                 _ = sigwinch.recv() => {
-                    let (cols, rows) = crossterm::terminal::size()?;
+                    let (cols, rows) = terminal_size_clamped();
                     write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
                 }
 
@@ -319,17 +345,19 @@ async fn run_session(
                                     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                                     render::render_session_info_overlay(
                                         &mut stdout, cols, rows,
-                                        &info.session_name,
-                                        &info.server_version,
-                                        MUX_VERSION,
-                                        &info.program,
-                                        info.uptime_secs,
-                                        info.terminal_size,
-                                        info.pid,
-                                        info.child_pid,
-                                        info.attached_secs,
-                                        info.waiting_clients,
-                                        info.latency_ms,
+                                        &render::SessionInfoView {
+                                            session_name: &info.session_name,
+                                            server_version: &info.server_version,
+                                            client_version: MUX_VERSION,
+                                            program: &info.program,
+                                            uptime_secs: info.uptime_secs,
+                                            terminal_size: info.terminal_size,
+                                            pid: info.pid,
+                                            child_pid: info.child_pid,
+                                            attached_secs: info.attached_secs,
+                                            waiting_clients: info.waiting_clients,
+                                            latency_ms: info.latency_ms,
+                                        },
                                     )?;
                                     // Wait for any key to dismiss
                                     stdin_rx.recv().await;
@@ -441,6 +469,18 @@ async fn wait_for_overlay_action(
             }
         }
     }
+}
+
+/// Read the local terminal size, clamped to a minimum of 1x1.
+///
+/// Some terminals momentarily report a 0-column or 0-row size while being
+/// shrunk to nothing. Forwarding a 0-dimension size to the PTY hands the
+/// child application a degenerate `0x0` window, which crashes TUIs that
+/// divide or index by the terminal dimensions. Clamp at the boundary so the
+/// child never sees a zero size.
+fn terminal_size_clamped() -> (u16, u16) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    (cols.max(1), rows.max(1))
 }
 
 /// Resolve the local hostname for terminal title display.

@@ -17,6 +17,9 @@ fn lock_session(name: &str) -> Result<File> {
     let lock_path = paths::socket_dir().join(format!("{name}.lock"));
     let file = OpenOptions::new()
         .create(true)
+        // Never truncate — this is a pure advisory lock file; another process
+        // may already hold it open and its contents are irrelevant.
+        .truncate(false)
         .write(true)
         .open(&lock_path)
         .context("failed to open lock file")?;

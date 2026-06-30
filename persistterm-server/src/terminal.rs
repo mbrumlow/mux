@@ -186,6 +186,10 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        // Clamp to a minimum of 1, matching wezterm-term's own internal floor,
+        // so `self.size` always agrees with the emulator's physical size.
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         self.inner.resize(TerminalSize {
             rows: rows as usize,
             cols: cols as usize,
@@ -455,12 +459,6 @@ impl Terminal {
         } else {
             Some(out)
         }
-    }
-
-    /// Invalidate the previous frame so the next `screen_diff()` returns a
-    /// full screen repaint. Used for periodic integrity refreshes.
-    pub fn invalidate_prev_frame(&mut self) {
-        self.prev_frame = None;
     }
 
     /// Check if the screen has changed since the last refresh. If so,
