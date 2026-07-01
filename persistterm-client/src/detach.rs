@@ -82,12 +82,46 @@ fn is_csi_final(b: u8) -> bool {
     (0x40..=0x7E).contains(&b)
 }
 
+impl Default for DetachFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DetachFilter {
     pub fn new() -> Self {
         Self {
             state: State::Normal,
             seq_buf: Vec::new(),
         }
+    }
+
+    /// Whether the filter is holding the bytes of an incomplete escape
+    /// sequence, waiting for more input to disambiguate it.
+    ///
+    /// The classic case is a lone `ESC` keypress: it could begin a CSI
+    /// sequence, so it is buffered rather than forwarded immediately. The
+    /// caller should arm a short timer when this returns true and call
+    /// [`flush`](Self::flush) if no further input arrives, so a bare ESC
+    /// still reaches the application promptly.
+    ///
+    /// Note: a bare detach prefix (`Ctrl-\`) is *not* reported as pending —
+    /// like a tmux/screen prefix it waits indefinitely for its command key.
+    pub fn has_pending(&self) -> bool {
+        !self.seq_buf.is_empty()
+    }
+
+    /// Forward any buffered, incomplete escape-sequence bytes and reset to
+    /// the normal state. Returns the bytes that should be sent to the server.
+    ///
+    /// A no-op when nothing is buffered, so calling it while an armed detach
+    /// prefix is waiting (which buffers no bytes) leaves the prefix intact.
+    pub fn flush(&mut self) -> Vec<u8> {
+        if self.seq_buf.is_empty() {
+            return Vec::new();
+        }
+        self.state = State::Normal;
+        std::mem::take(&mut self.seq_buf)
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> FilterResult {
@@ -631,6 +665,62 @@ mod tests {
         let r = f.feed(&input);
         assert!(r.forward.is_empty());
         assert!(r.info);
+    }
+
+    // ── Idle-flush (lone ESC) tests ─────────────────────────────
+
+    #[test]
+    fn lone_esc_is_buffered_then_flushed() {
+        let mut f = DetachFilter::new();
+        // A bare ESC is held, not forwarded, pending disambiguation.
+        let r = f.feed(&[ESC]);
+        assert!(r.forward.is_empty());
+        assert!(f.has_pending());
+        // On idle flush it is delivered.
+        let flushed = f.flush();
+        assert_eq!(flushed, vec![ESC]);
+        assert!(!f.has_pending());
+    }
+
+    #[test]
+    fn partial_csi_is_pending_and_flushes() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(b"\x1b[1;2"); // incomplete CSI
+        assert!(r.forward.is_empty());
+        assert!(f.has_pending());
+        assert_eq!(f.flush(), b"\x1b[1;2");
+        assert!(!f.has_pending());
+    }
+
+    #[test]
+    fn bare_prefix_is_not_pending() {
+        let mut f = DetachFilter::new();
+        // Ctrl-\ alone waits for its command key indefinitely (prefix
+        // semantics), so it must NOT be reported as flushable.
+        let r = f.feed(&[PREFIX_RAW]);
+        assert!(r.forward.is_empty());
+        assert!(!f.has_pending());
+        assert!(f.flush().is_empty());
+        // Prefix is still armed: the next key is treated as a command.
+        let r2 = f.feed(&[DETACH_RAW]);
+        assert!(r2.detach);
+    }
+
+    #[test]
+    fn flush_then_resumes_normally() {
+        let mut f = DetachFilter::new();
+        f.feed(&[ESC]);
+        assert_eq!(f.flush(), vec![ESC]);
+        let r = f.feed(b"hello");
+        assert_eq!(r.forward, b"hello");
+    }
+
+    #[test]
+    fn no_pending_after_complete_sequence() {
+        let mut f = DetachFilter::new();
+        let r = f.feed(b"\x1b[A"); // complete arrow-up
+        assert_eq!(r.forward, b"\x1b[A");
+        assert!(!f.has_pending());
     }
 
     #[test]

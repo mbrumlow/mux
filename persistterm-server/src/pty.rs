@@ -3,6 +3,9 @@ use std::io::{Read, Write};
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
+/// A spawned PTY handle paired with its output reader and input writer.
+type SpawnedPty = (PtyHandle, Box<dyn Read + Send>, Box<dyn Write + Send>);
+
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -16,7 +19,7 @@ impl PtyHandle {
         program: &[String],
         session_name: &str,
         extra_env: &[(String, String)],
-    ) -> Result<(Self, Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    ) -> Result<SpawnedPty> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -66,9 +69,11 @@ impl PtyHandle {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        // Never hand the child a 0-dimension window — degenerate sizes crash
+        // TUIs that divide or index by the terminal dimensions.
         self.master.resize(PtySize {
-            rows,
-            cols,
+            rows: rows.max(1),
+            cols: cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
         })?;

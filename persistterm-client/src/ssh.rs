@@ -9,15 +9,11 @@ use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Options for SSH connections.
+#[derive(Default)]
 pub struct SshOptions {
     pub compression: bool,
 }
 
-impl Default for SshOptions {
-    fn default() -> Self {
-        Self { compression: false }
-    }
-}
 
 struct SshHandler {
     host: String,
@@ -213,7 +209,7 @@ async fn try_key_file_auth(
         let auth_result = session
             .authenticate_publickey(
                 username,
-                PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash.clone()),
+                PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
             )
             .await?;
         if auth_result.success() {
