@@ -36,19 +36,26 @@ pub struct DetachFilter {
 }
 
 /// Parse CSI u parameters (bytes between '[' and 'u').
-/// Returns (keycode, modifier_param) where modifier_param defaults to 1 (none).
-fn parse_csi_u(params: &[u8]) -> Option<(u32, u32)> {
+/// Returns (keycode, modifier_param, event_type) where modifier_param defaults to 1 (none)
+/// and event_type defaults to 0 (implicit press).
+/// event_type: 0=implicit press, 1=press, 2=repeat, 3=release
+fn parse_csi_u(params: &[u8]) -> Option<(u32, u32, u32)> {
     let s = std::str::from_utf8(params).ok()?;
     let mut parts = s.split(';');
 
     let keycode: u32 = parts.next()?.split(':').next()?.parse().ok()?;
 
-    let modifiers: u32 = match parts.next() {
-        Some(mod_part) => mod_part.split(':').next()?.parse().ok().unwrap_or(1),
-        None => 1,
+    let (modifiers, event_type) = match parts.next() {
+        Some(mod_part) => {
+            let mut sub = mod_part.split(':');
+            let mods = sub.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+            let evt = sub.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            (mods, evt)
+        }
+        None => (1, 0),
     };
 
-    Some((keycode, modifiers))
+    Some((keycode, modifiers, event_type))
 }
 
 fn is_ctrl_backslash(keycode: u32, modifiers: u32) -> bool {
@@ -136,11 +143,15 @@ impl DetachFilter {
                         // CSI u sequence complete — check if it's Ctrl+backslash
                         // params are between '[' and 'u': seq_buf = [ESC, '[', ...params..., 'u']
                         let params = &self.seq_buf[2..self.seq_buf.len() - 1];
-                        if let Some((kc, mods)) = parse_csi_u(params) {
-                            if is_ctrl_backslash(kc, mods) {
-                                // This is our prefix key — consume it
+                        if let Some((kc, mods, evt)) = parse_csi_u(params) {
+                            if is_ctrl_backslash(kc, mods) && evt != 3 {
+                                // This is our prefix key (press only) — consume it
                                 self.seq_buf.clear();
                                 self.state = State::GotPrefix;
+                            } else if is_ctrl_backslash(kc, mods) && evt == 3 {
+                                // Release of prefix key — drop it
+                                self.seq_buf.clear();
+                                self.state = State::Normal;
                             } else {
                                 forward.extend_from_slice(&self.seq_buf);
                                 self.seq_buf.clear();
@@ -235,8 +246,13 @@ impl DetachFilter {
                         }
                     } else if b == b'u' {
                         let params = &self.seq_buf[2..self.seq_buf.len() - 1];
-                        if let Some((kc, mods)) = parse_csi_u(params) {
-                            if is_plain_d(kc, mods) {
+                        if let Some((kc, mods, evt)) = parse_csi_u(params) {
+                            // Only trigger actions on press events (0=implicit, 1=press)
+                            if evt == 3 || evt == 2 {
+                                // Release/repeat after prefix — swallow
+                                self.seq_buf.clear();
+                                self.state = State::Normal;
+                            } else if is_plain_d(kc, mods) {
                                 self.seq_buf.clear();
                                 self.state = State::Normal;
                                 return FilterResult {

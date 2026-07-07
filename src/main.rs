@@ -47,6 +47,23 @@ fn main() -> Result<()> {
                 SessionTarget::Local(session) => {
                     paths::validate_session_name(&session)?;
 
+                    // Init tracing to client log file
+                    paths::ensure_dirs()?;
+                    let log_path = paths::client_log_path("local", &session);
+                    let log_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&log_path)?;
+                    tracing_subscriber::fmt()
+                        .with_env_filter(
+                            EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| EnvFilter::new("info")),
+                        )
+                        .with_ansi(false)
+                        .with_writer(log_file)
+                        .init();
+
                     if cli.restart {
                         let _ = session_mgmt::kill_session(&session);
                     }
