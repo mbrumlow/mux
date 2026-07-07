@@ -110,10 +110,8 @@ fn expand_vars(value: &str, session_name: &str) -> String {
                 }
             } else if var_name == "MUX_SESSION" {
                 result.push_str(session_name);
-            } else {
-                if let Ok(val) = std::env::var(&var_name) {
-                    result.push_str(&val);
-                }
+            } else if let Ok(val) = std::env::var(&var_name) {
+                result.push_str(&val);
             }
         } else {
             result.push(c);
