@@ -54,12 +54,14 @@ enum MsgAction {
 
 /// Process a single S2C message, writing any terminal output to `stdout`.
 /// Returns `MsgAction::Exit` if the session should end.
+#[allow(clippy::too_many_arguments)]
 fn handle_server_msg(
     msg: S2C,
     stdout: &mut std::io::Stdout,
     outer_kkp_active: &mut bool,
     local_dec_modes: &mut std::collections::HashSet<u16>,
     last_pong: &mut Instant,
+    last_ping: &Option<(u64, Instant)>,
     last_rtt_ms: &mut Option<u64>,
     kkp_translator: &mut kkp::KkpTranslator,
 ) -> std::io::Result<MsgAction> {
@@ -151,11 +153,13 @@ fn handle_server_msg(
         }
         S2C::Pong { t } => {
             *last_pong = Instant::now();
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            *last_rtt_ms = Some(now_ms.saturating_sub(t));
+            // Compute RTT from the monotonic send timestamp — wall-clock
+            // deltas produce absurd values if the clock steps mid-flight.
+            if let Some((sent_t, sent_at)) = last_ping {
+                if *sent_t == t {
+                    *last_rtt_ms = Some(sent_at.elapsed().as_millis() as u64);
+                }
+            }
         }
         _ => {}
     }
@@ -289,6 +293,7 @@ async fn run_session(
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(5));
     keepalive_interval.tick().await; // consume initial tick
     let mut last_pong = Instant::now();
+    let mut last_ping: Option<(u64, Instant)> = None;
     let mut last_rtt_ms: Option<u64> = None;
 
     // How long to hold an ambiguous lone-ESC (or other incomplete escape
@@ -304,7 +309,15 @@ async fn run_session(
                 biased;
 
                 // Local stdin → send to server (highest priority)
-                Some(data) = stdin_rx.recv() => {
+                data = stdin_rx.recv() => {
+                    let Some(data) = data else {
+                        // stdin closed (terminal gone / EOF) — detach rather
+                        // than lingering as an output-only client with no way
+                        // to send the detach chord.
+                        info!("stdin closed, detaching");
+                        exit_reason = ExitReason::Detached;
+                        break;
+                    };
                     let result = detach_filter.feed(&data);
                     let forward = strip_focus_events(&result.forward);
                     // Always run through translator — it filters terminal responses
@@ -368,6 +381,7 @@ async fn run_session(
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    last_ping = Some((t, Instant::now()));
                     write_frame_async(&mut writer, &C2S::Ping { t }).await?;
                 }
 
@@ -378,12 +392,16 @@ async fn run_session(
                         None => std::future::pending().await,
                     }
                 } => {
+                    // Set when the info overlay was shown: screen diffs queued
+                    // behind it apply to the pre-overlay screen and would paint
+                    // garbage — drop them; the requested snapshot repaints.
+                    let mut drop_stale_diffs = false;
                     match msg {
                         Some(msg) => {
                             match handle_server_msg(
                                 msg, &mut stdout, &mut outer_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
-                                &mut last_rtt_ms, &mut kkp_translator,
+                                &last_ping, &mut last_rtt_ms, &mut kkp_translator,
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;
@@ -412,6 +430,7 @@ async fn run_session(
                                     stdin_rx.recv().await;
                                     // Restore session screen
                                     write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
+                                    drop_stale_diffs = true;
                                 }
                                 MsgAction::Continue => {}
                             }
@@ -427,10 +446,13 @@ async fn run_session(
                     // to the terminal in a single flush.
                     if let Some(rx) = server_rx.as_mut() {
                         while let Ok(msg) = rx.try_recv() {
+                            if drop_stale_diffs && matches!(msg, S2C::ScreenDiff { .. }) {
+                                continue;
+                            }
                             match handle_server_msg(
                                 msg, &mut stdout, &mut outer_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
-                                &mut last_rtt_ms, &mut kkp_translator,
+                                &last_ping, &mut last_rtt_ms, &mut kkp_translator,
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;
@@ -476,6 +498,45 @@ enum OverlayAction {
     Exit,
 }
 
+/// A keypress interpreted for overlay prompts.
+enum OverlayKey {
+    Confirm,
+    Exit,
+    Other,
+}
+
+/// Classify a raw input chunk for overlay prompts. Escape sequences (arrow
+/// keys, KKP-encoded keys) are skipped rather than matched byte-by-byte, so
+/// pressing an arrow key (`ESC [ A`) no longer reads as ESC and exits the
+/// overlay. Only a lone ESC byte or a literal `q` means exit.
+fn classify_overlay_input(data: &[u8]) -> OverlayKey {
+    if data == [0x1b] {
+        return OverlayKey::Exit;
+    }
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            0x1b => {
+                // Skip the whole escape sequence: CSI runs to its final byte
+                // (0x40–0x7E); other introducers (SS3 etc.) are skipped as a
+                // two-byte prefix and their final byte falls through harmlessly.
+                i += 1;
+                if i < data.len() && data[i] == b'[' {
+                    i += 1;
+                    while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            0x20 | 0x0d | 0x0a => return OverlayKey::Confirm,
+            b'q' => return OverlayKey::Exit,
+            _ => i += 1,
+        }
+    }
+    OverlayKey::Other
+}
+
 /// Wait for overlay input or server notification (auto-reclaim).
 async fn wait_for_overlay_action(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -486,14 +547,12 @@ async fn wait_for_overlay_action(
         tokio::select! {
             data = stdin_rx.recv() => {
                 if let Some(data) = data {
-                    for &b in &data {
-                        match b {
-                            // Space or Enter → reconnect
-                            0x20 | 0x0d | 0x0a => return OverlayAction::Reconnect,
-                            // 'q' or Esc → exit
-                            b'q' | 0x1b => return OverlayAction::Exit,
-                            _ => {}
-                        }
+                    match classify_overlay_input(&data) {
+                        // Space or Enter → reconnect
+                        OverlayKey::Confirm => return OverlayAction::Reconnect,
+                        // 'q' or lone Esc → exit
+                        OverlayKey::Exit => return OverlayAction::Exit,
+                        OverlayKey::Other => {}
                     }
                 } else {
                     // stdin closed
@@ -629,17 +688,13 @@ async fn wait_for_manual_action(
 ) -> ReconnectAction {
     loop {
         match stdin_rx.recv().await {
-            Some(data) => {
-                for &b in &data {
-                    match b {
-                        // Space or Enter → retry
-                        0x20 | 0x0d | 0x0a => return ReconnectAction::Retry,
-                        // q or Esc → exit
-                        b'q' | 0x1b => return ReconnectAction::Exit,
-                        _ => {}
-                    }
-                }
-            }
+            Some(data) => match classify_overlay_input(&data) {
+                // Space or Enter → retry
+                OverlayKey::Confirm => return ReconnectAction::Retry,
+                // q or lone Esc → exit
+                OverlayKey::Exit => return ReconnectAction::Exit,
+                OverlayKey::Other => {}
+            },
             None => return ReconnectAction::Exit,
         }
     }
@@ -668,14 +723,12 @@ async fn show_reconnect_overlay(
         tokio::select! {
             data = stdin_rx.recv() => {
                 if let Some(data) = data {
-                    for &b in &data {
-                        match b {
-                            // Enter or Space → retry now
-                            0x0d | 0x0a | 0x20 => return ReconnectAction::Retry,
-                            // q or Esc → exit
-                            b'q' | 0x1b => return ReconnectAction::Exit,
-                            _ => {}
-                        }
+                    match classify_overlay_input(&data) {
+                        // Enter or Space → retry now
+                        OverlayKey::Confirm => return ReconnectAction::Retry,
+                        // q or lone Esc → exit
+                        OverlayKey::Exit => return ReconnectAction::Exit,
+                        OverlayKey::Other => {}
                     }
                 } else {
                     return ReconnectAction::Exit;
@@ -791,4 +844,43 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
     cleanup_terminal(session, &result);
 
     result.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_overlay_input, OverlayKey};
+
+    #[test]
+    fn lone_esc_exits() {
+        assert!(matches!(classify_overlay_input(&[0x1b]), OverlayKey::Exit));
+    }
+
+    #[test]
+    fn arrow_key_is_ignored() {
+        assert!(matches!(classify_overlay_input(b"\x1b[A"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn plain_keys_classify() {
+        assert!(matches!(classify_overlay_input(b"q"), OverlayKey::Exit));
+        assert!(matches!(classify_overlay_input(b"\r"), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b"\n"), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b" "), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b"x"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn escape_sequences_are_skipped_whole() {
+        // KKP-encoded 'q' must not exit
+        assert!(matches!(classify_overlay_input(b"\x1b[113u"), OverlayKey::Other));
+        // Mouse SGR report (contains a space-free param region + final byte)
+        assert!(matches!(classify_overlay_input(b"\x1b[<0;33;22M"), OverlayKey::Other));
+        // SS3 arrow
+        assert!(matches!(classify_overlay_input(b"\x1bOA"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn key_after_sequence_still_counts() {
+        assert!(matches!(classify_overlay_input(b"\x1b[A\r"), OverlayKey::Confirm));
+    }
 }

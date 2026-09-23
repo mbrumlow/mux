@@ -59,13 +59,17 @@ pub struct Terminal {
     dec_modes: BTreeSet<u16>,
     /// Buffer for OSC sequences that span multiple PTY read chunks.
     pending_osc: Vec<u8>,
+    /// Trailing partial escape sequence carried over from the previous chunk,
+    /// so KKP/DEC-mode sequences split across PTY reads are still detected.
+    pending_esc: Vec<u8>,
     /// Previous frame for computing diffs.
     prev_frame: Option<PrevFrame>,
     /// Whether the application has an active synchronized update (DEC mode 2026).
     app_sync_active: bool,
     size: (u16, u16),
-    /// Hash of the last refresh-check screen, to avoid resending identical screens.
-    last_refresh_hash: u64,
+    /// Emulator seqno at the last refresh check, to avoid resending
+    /// identical screens.
+    last_refresh_seqno: SequenceNo,
 }
 
 impl Terminal {
@@ -91,10 +95,11 @@ impl Terminal {
             last_kkp_flags: 0,
             dec_modes: BTreeSet::new(),
             pending_osc: Vec::new(),
+            pending_esc: Vec::new(),
             prev_frame: None,
             app_sync_active: false,
             size: (rows, cols),
-            last_refresh_hash: 0,
+            last_refresh_seqno: 0,
         }
     }
 
@@ -102,15 +107,29 @@ impl Terminal {
     pub fn process(&mut self, data: &[u8]) -> PtyEvents {
         let old_kkp = self.last_kkp_flags;
 
-        // Scan for DEC/OSC changes (still needed — wezterm-term doesn't expose these)
+        // Scan for DEC/OSC changes (wezterm-term doesn't expose these). Prepend
+        // any partial escape sequence carried over from the previous chunk so a
+        // DEC-mode sequence split across PTY reads is still detected. The
+        // emulator below gets the raw bytes — it keeps its own parser state
+        // across chunks, so KKP (which it owns) needs no stitching here.
         let mut client_forwards = Vec::new();
         let mut dec_mode_changes = Vec::new();
+        let stitched;
+        let scan_data: &[u8] = if self.pending_esc.is_empty() {
+            data
+        } else {
+            let mut buf = std::mem::take(&mut self.pending_esc);
+            buf.extend_from_slice(data);
+            stitched = buf;
+            &stitched
+        };
         scan_pty_output(
-            data,
+            scan_data,
             &mut self.dec_modes,
             &mut dec_mode_changes,
             &mut client_forwards,
             &mut self.pending_osc,
+            &mut self.pending_esc,
             &mut self.app_sync_active,
         );
 
@@ -467,16 +486,18 @@ impl Terminal {
         }
     }
 
-    /// Check if the screen has changed since the last refresh. If so,
-    /// invalidate the previous frame so `screen_diff()` produces a full
-    /// repaint. Returns true if a refresh is needed.
+    /// Check if the emulator state has changed since the last refresh check.
+    /// If so, invalidate the previous frame so `screen_diff()` produces a
+    /// full repaint. Returns true if a refresh is needed.
+    ///
+    /// Uses the emulator's sequence number instead of rendering and hashing
+    /// the whole screen — O(1) instead of O(rows × cols) per idle tick.
     pub fn refresh_if_changed(&mut self) -> bool {
-        let data = self.screen_formatted();
-        let hash = simple_hash(&data);
-        if hash == self.last_refresh_hash {
+        let seqno = self.inner.current_seqno();
+        if seqno == self.last_refresh_seqno {
             return false;
         }
-        self.last_refresh_hash = hash;
+        self.last_refresh_seqno = seqno;
         self.prev_frame = None;
         true
     }
@@ -802,6 +823,26 @@ fn handle_osc(body: &[u8], client_forwards: &mut Vec<Vec<u8>>) {
     }
 }
 
+/// Maximum length of a partial escape sequence carried between chunks.
+/// The DEC-mode sequences we detect have short parameter lists; anything
+/// longer is garbage and not worth tracking.
+const MAX_PENDING_ESC: usize = 64;
+
+/// True if `rest` (which starts with ESC and runs to the end of the chunk)
+/// is an incomplete prefix of a sequence the scanner cares about, and should
+/// be carried over to the next chunk.
+fn is_partial_escape(rest: &[u8]) -> bool {
+    match rest {
+        // Lone ESC, "ESC [", or "ESC ]" at the very end of the chunk.
+        [0x1b] | [0x1b, b'['] | [0x1b, b']'] => true,
+        // DEC private mode ("ESC [ ?"), params still incomplete.
+        [0x1b, b'[', b'?', params @ ..] => {
+            params.iter().all(|&b| b.is_ascii_digit() || b == b';')
+        }
+        _ => false,
+    }
+}
+
 /// Scan PTY output for DEC private mode changes and OSC clipboard.
 /// KKP tracking is handled by wezterm-term's authoritative state.
 fn scan_pty_output(
@@ -810,6 +851,7 @@ fn scan_pty_output(
     dec_mode_changes: &mut Vec<(u16, bool)>,
     client_forwards: &mut Vec<Vec<u8>>,
     pending_osc: &mut Vec<u8>,
+    pending_esc: &mut Vec<u8>,
     app_sync_active: &mut bool,
 ) {
     let mut i = 0;
@@ -845,6 +887,17 @@ fn scan_pty_output(
     }
 
     while i < data.len() {
+        // Chunk ends in an incomplete sequence we track — carry it over so
+        // the next chunk can complete it. Oversized partials are dropped
+        // (bounded memory; wezterm still handles the emulation side).
+        if data[i] == 0x1b && is_partial_escape(&data[i..]) {
+            let tail = &data[i..];
+            if tail.len() <= MAX_PENDING_ESC {
+                pending_esc.extend_from_slice(tail);
+            }
+            break;
+        }
+
         if data[i] == 0x1b
             && i + 1 < data.len()
             && data[i + 1] == b'['
@@ -908,12 +961,75 @@ fn scan_pty_output(
     }
 }
 
-/// FNV-1a hash for fast screen content comparison.
-fn simple_hash(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+
+#[cfg(test)]
+mod tests {
+    use super::Terminal;
+
+    fn term() -> Terminal {
+        Terminal::new(24, 80, Box::new(std::io::sink()))
     }
-    h
+
+    #[test]
+    fn dec_mode_detected_in_single_chunk() {
+        let mut t = term();
+        let ev = t.process(b"\x1b[?1000h");
+        assert_eq!(ev.dec_mode_changes, vec![(1000, true)]);
+    }
+
+    #[test]
+    fn dec_mode_split_across_chunks() {
+        let mut t = term();
+        let ev1 = t.process(b"\x1b[?10");
+        assert!(ev1.dec_mode_changes.is_empty());
+        let ev2 = t.process(b"00h");
+        assert_eq!(ev2.dec_mode_changes, vec![(1000, true)]);
+    }
+
+    #[test]
+    fn dec_mode_split_at_esc() {
+        let mut t = term();
+        t.process(b"\x1b");
+        let ev = t.process(b"[?2004h");
+        assert_eq!(ev.dec_mode_changes, vec![(2004, true)]);
+    }
+
+    #[test]
+    fn kkp_push_split_across_chunks() {
+        // KKP is owned by wezterm-term now; verify its parser still resolves a
+        // push sequence split across process() calls (the emulator carries its
+        // own state between advance_bytes calls).
+        let mut t = term();
+        let ev1 = t.process(b"\x1b[>1");
+        assert!(ev1.kkp_changed.is_none());
+        let ev2 = t.process(b"u");
+        assert_eq!(ev2.kkp_changed, Some(1));
+    }
+
+    #[test]
+    fn untracked_sequence_split_is_harmless() {
+        let mut t = term();
+        t.process(b"\x1b");
+        let ev = t.process(b"[Ahello");
+        assert!(ev.dec_mode_changes.is_empty());
+        assert!(ev.kkp_changed.is_none());
+    }
+
+    #[test]
+    fn osc52_split_after_introducer() {
+        let mut t = term();
+        t.process(b"\x1b]");
+        let ev = t.process(b"52;c;QUJD\x07");
+        assert_eq!(ev.osc_forwards, vec![b"52;c;QUJD".to_vec()]);
+    }
+
+    #[test]
+    fn osc52_split_mid_body() {
+        let mut t = term();
+        let ev1 = t.process(b"\x1b]52;c;QU");
+        assert!(ev1.osc_forwards.is_empty());
+        let ev2 = t.process(b"JD\x07");
+        assert_eq!(ev2.osc_forwards, vec![b"52;c;QUJD".to_vec()]);
+    }
+
 }

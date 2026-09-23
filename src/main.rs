@@ -10,17 +10,26 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Commands, SessionTarget};
 
+/// Default log filter: only mux's own crates. The embedded terminal emulator
+/// (wezterm-term) logs raw escape-sequence payloads — i.e. session content —
+/// at warn/info level via the `log` bridge, so everything outside our crates
+/// stays off unless RUST_LOG explicitly enables it.
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("off,mux=info,persistterm_server=info,persistterm_client=info,persistterm_proto=info")
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Commands::Server { session, rows, cols, program }) => {
+            paths::validate_session_name(session)?;
+
             // Server subprocess: init tracing to file (no ANSI)
             tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new("info")),
-                )
+                .with_env_filter(default_env_filter())
                 .with_ansi(false)
                 .init();
 
@@ -50,16 +59,9 @@ fn main() -> Result<()> {
                     // Init tracing to client log file
                     paths::ensure_dirs()?;
                     let log_path = paths::client_log_path("local", &session);
-                    let log_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&log_path)?;
+                    let log_file = paths::open_log_file(&log_path)?;
                     tracing_subscriber::fmt()
-                        .with_env_filter(
-                            EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| EnvFilter::new("info")),
-                        )
+                        .with_env_filter(default_env_filter())
                         .with_ansi(false)
                         .with_writer(log_file)
                         .init();
@@ -76,16 +78,9 @@ fn main() -> Result<()> {
                     // Init tracing to client log file
                     paths::ensure_dirs()?;
                     let log_path = paths::client_log_path(&host, &session);
-                    let log_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&log_path)?;
+                    let log_file = paths::open_log_file(&log_path)?;
                     tracing_subscriber::fmt()
-                        .with_env_filter(
-                            EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| EnvFilter::new("info")),
-                        )
+                        .with_env_filter(default_env_filter())
                         .with_ansi(false)
                         .with_writer(log_file)
                         .init();
