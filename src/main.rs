@@ -56,6 +56,16 @@ fn main() -> Result<()> {
                 SessionTarget::Local(session) => {
                     paths::validate_session_name(&session)?;
 
+                    // Init tracing to client log file
+                    paths::ensure_dirs()?;
+                    let log_path = paths::client_log_path("local", &session);
+                    let log_file = paths::open_log_file(&log_path)?;
+                    tracing_subscriber::fmt()
+                        .with_env_filter(default_env_filter())
+                        .with_ansi(false)
+                        .with_writer(log_file)
+                        .init();
+
                     if cli.restart {
                         let _ = session_mgmt::kill_session(&session);
                     }
