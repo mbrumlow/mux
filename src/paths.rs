@@ -44,8 +44,26 @@ pub fn log_dir() -> PathBuf {
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".local/state/mux")
     } else {
-        PathBuf::from("/tmp/mux-logs")
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/mux-logs-{uid}"))
     }
+}
+
+/// Open (create/truncate) a log file with 0600 permissions. Logs can contain
+/// fragments of session content, so they must never be group/world readable.
+pub fn open_log_file(path: &std::path::Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    // mode() only applies on creation — tighten pre-existing files too.
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    Ok(file)
 }
 
 /// Log file path for a named session.

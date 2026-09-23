@@ -54,12 +54,7 @@ pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, 
     }
 
     // Open log file, truncating any previous content
-    let log_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(paths::log_path(name))
-        .context("failed to open log file")?;
+    let log_file = paths::open_log_file(&paths::log_path(name))?;
 
     let log_file_err = log_file.try_clone().context("failed to clone log file")?;
 

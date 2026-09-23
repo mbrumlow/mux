@@ -14,6 +14,11 @@ type SequenceNo = tattoy_termwiz::surface::SequenceNo;
 /// DEC private modes that should be forwarded to the client terminal.
 const FORWARDED_DEC_MODES: &[u16] = &[1000, 1002, 1003, 1004, 1005, 1006, 2004];
 
+/// Maximum KKP push-stack depth. Kitty itself caps the stack and evicts the
+/// oldest entry on overflow; without a cap, `cat`-ing a crafted file grows
+/// memory without bound.
+const MAX_KKP_STACK: usize = 128;
+
 /// Events produced by processing PTY output.
 pub struct PtyEvents {
     /// If KKP mode changed, the new flags value (0 = disabled).
@@ -897,6 +902,9 @@ fn scan_pty_output(
                     } else {
                         0
                     };
+                    if kkp_stack.len() >= MAX_KKP_STACK {
+                        kkp_stack.remove(0);
+                    }
                     kkp_stack.push(flags);
                     i = j + 1;
                     continue;

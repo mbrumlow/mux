@@ -82,6 +82,22 @@ async fn notify_session_ended(
     }
 }
 
+/// Validate OSC 52 clipboard pieces before forwarding to the client terminal.
+/// The emulator sandboxes all other session output, but the clipboard is
+/// replayed as a raw escape sequence on the client's terminal — an OSC body
+/// may legally contain ESC bytes, which some terminals treat as terminating
+/// the OSC, turning the remainder into arbitrary escape injection. Only pass
+/// well-formed selection params and base64 payloads (or a `?` query).
+fn valid_osc52(params: &str, data: &str) -> bool {
+    params
+        .chars()
+        .all(|c| matches!(c, 'c' | 'p' | 'q' | 's' | '0'..='7'))
+        && (data == "?"
+            || data
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
+}
+
 /// Channel-backed writer that offloads blocking PTY writes to a dedicated thread.
 /// Both the session loop and wezterm-term can clone and write without blocking
 /// the tokio runtime.
@@ -384,6 +400,10 @@ impl Session {
                                         if let Ok(body_str) = std::str::from_utf8(osc_body) {
                                             if let Some(rest) = body_str.strip_prefix("52;") {
                                                 if let Some((params, data)) = rest.split_once(';') {
+                                                    if !valid_osc52(params, data) {
+                                                        warn!("dropping malformed OSC 52 (invalid params or data)");
+                                                        continue;
+                                                    }
                                                     if let Err(e) = write_frame_async(
                                                         &mut conn.writer,
                                                         &S2C::Clipboard {
@@ -634,5 +654,35 @@ fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Box<[u8]>>) 
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_osc52;
+
+    #[test]
+    fn osc52_accepts_base64_set() {
+        assert!(valid_osc52("c", "aGVsbG8=")); // "hello"
+        assert!(valid_osc52("", "aGVsbG8="));
+        assert!(valid_osc52("cp0", "QUJD"));
+    }
+
+    #[test]
+    fn osc52_accepts_query() {
+        assert!(valid_osc52("c", "?"));
+    }
+
+    #[test]
+    fn osc52_rejects_escape_bytes() {
+        assert!(!valid_osc52("c", "aGVs\x1b[31mbG8="));
+        assert!(!valid_osc52("c\x1b", "aGVsbG8="));
+        assert!(!valid_osc52("c", "?\x1b[2J"));
+    }
+
+    #[test]
+    fn osc52_rejects_non_base64() {
+        assert!(!valid_osc52("c", "hello world"));
+        assert!(!valid_osc52("x", "aGVsbG8="));
     }
 }
