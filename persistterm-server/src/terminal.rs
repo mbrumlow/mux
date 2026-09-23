@@ -71,8 +71,9 @@ pub struct Terminal {
     /// Whether the application has an active synchronized update (DEC mode 2026).
     app_sync_active: bool,
     size: (u16, u16),
-    /// Hash of the last refresh-check screen, to avoid resending identical screens.
-    last_refresh_hash: u64,
+    /// Emulator seqno at the last refresh check, to avoid resending
+    /// identical screens.
+    last_refresh_seqno: SequenceNo,
 }
 
 impl Terminal {
@@ -102,7 +103,7 @@ impl Terminal {
             prev_frame: None,
             app_sync_active: false,
             size: (rows, cols),
-            last_refresh_hash: 0,
+            last_refresh_seqno: 0,
         }
     }
 
@@ -483,16 +484,18 @@ impl Terminal {
         }
     }
 
-    /// Check if the screen has changed since the last refresh. If so,
-    /// invalidate the previous frame so `screen_diff()` produces a full
-    /// repaint. Returns true if a refresh is needed.
+    /// Check if the emulator state has changed since the last refresh check.
+    /// If so, invalidate the previous frame so `screen_diff()` produces a
+    /// full repaint. Returns true if a refresh is needed.
+    ///
+    /// Uses the emulator's sequence number instead of rendering and hashing
+    /// the whole screen — O(1) instead of O(rows × cols) per idle tick.
     pub fn refresh_if_changed(&mut self) -> bool {
-        let data = self.screen_formatted();
-        let hash = simple_hash(&data);
-        if hash == self.last_refresh_hash {
+        let seqno = self.inner.current_seqno();
+        if seqno == self.last_refresh_seqno {
             return false;
         }
-        self.last_refresh_hash = hash;
+        self.last_refresh_seqno = seqno;
         self.prev_frame = None;
         true
     }
@@ -1039,15 +1042,6 @@ fn scan_pty_output(
     }
 }
 
-/// FNV-1a hash for fast screen content comparison.
-fn simple_hash(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
 
 #[cfg(test)]
 mod tests {

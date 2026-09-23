@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::paths;
 
 /// Acquire an advisory lock for a session to prevent TOCTOU races.
-fn lock_session(name: &str) -> Result<File> {
+pub(crate) fn lock_session(name: &str) -> Result<File> {
     paths::ensure_dirs()?;
     let lock_path = paths::socket_dir().join(format!("{name}.lock"));
     let file = OpenOptions::new()

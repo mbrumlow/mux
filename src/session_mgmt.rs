@@ -33,12 +33,18 @@ pub fn list_sessions() -> Result<()> {
             continue;
         }
 
-        if UnixStream::connect(&path).is_ok() {
-            println!("{name}");
-            found = true;
-        } else {
-            // Stale socket — clean up
-            let _ = std::fs::remove_file(&path);
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                println!("{name}");
+                found = true;
+            }
+            // No listener behind the file — genuinely stale, clean up.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(&path);
+            }
+            // Transient failure (e.g. accept backlog full) — the server may
+            // be alive; deleting the socket would orphan it.
+            Err(_) => {}
         }
     }
 
@@ -52,6 +58,11 @@ pub fn list_sessions() -> Result<()> {
 /// Kill a named session.
 pub fn kill_session(name: &str) -> Result<()> {
     paths::validate_session_name(name)?;
+
+    // Hold the session lock so a concurrent attach can't race the teardown
+    // and respawn a server while we're removing its files.
+    let _lock = daemon::lock_session(name)?;
+
     let sock = paths::socket_path(name);
 
     if !sock.exists() {
@@ -63,15 +74,35 @@ pub fn kill_session(name: &str) -> Result<()> {
         .with_context(|| format!("session '{name}' is not running"))?;
 
     let pid = get_peer_pid(&stream)?;
+    drop(stream);
     if pid > 0 {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
-        // Give the server time to shut down
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait until the server stops serving before touching its files —
+        // removing the socket from under a live server would orphan it.
+        // Probe the socket rather than the pid: a dead-but-unreaped server
+        // is a zombie that `kill(pid, 0)` still reports as alive, but it no
+        // longer accepts connections.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // Any connect failure means the server is gone: a clean shutdown
+            // removes the socket file (ENOENT), a crash leaves a stale socket
+            // with no listener (ECONNREFUSED).
+            if UnixStream::connect(&sock).is_err() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "session '{name}' (pid {pid}) still serving after 2s; \
+                     leaving its socket in place"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 
-    // Clean up socket, lock, and agent symlink
+    // Clean up anything the server's own shutdown left behind
     let _ = std::fs::remove_file(&sock);
     let lock_path = paths::socket_dir().join(format!("{name}.lock"));
     let _ = std::fs::remove_file(lock_path);

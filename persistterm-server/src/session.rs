@@ -262,10 +262,17 @@ impl Session {
                         }
                         Some(C2S::Resize { width, height }) => {
                             info!(width, height, "client resize");
+                            let size_changed = (height, width) != self.terminal.size();
                             if let Err(e) = self.pty.resize(height, width) {
                                 error!("failed to resize PTY: {e}");
                             }
                             self.terminal.resize(height, width);
+                            // Give the child time to redraw at the new size
+                            // before snapshotting, so we don't capture (and
+                            // send) a stale pre-reflow frame.
+                            if size_changed {
+                                self.drain_pty_after_resize().await;
+                            }
                             // Send full screen after resize
                             let conn = client.as_mut().unwrap();
                             let data = self.terminal.screen_formatted();

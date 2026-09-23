@@ -59,6 +59,7 @@ fn handle_server_msg(
     local_kkp_active: &mut bool,
     local_dec_modes: &mut std::collections::HashSet<u16>,
     last_pong: &mut Instant,
+    last_ping: &Option<(u64, Instant)>,
     last_rtt_ms: &mut Option<u64>,
 ) -> std::io::Result<MsgAction> {
     match msg {
@@ -131,11 +132,13 @@ fn handle_server_msg(
         }
         S2C::Pong { t } => {
             *last_pong = Instant::now();
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            *last_rtt_ms = Some(now_ms.saturating_sub(t));
+            // Compute RTT from the monotonic send timestamp — wall-clock
+            // deltas produce absurd values if the clock steps mid-flight.
+            if let Some((sent_t, sent_at)) = last_ping {
+                if *sent_t == t {
+                    *last_rtt_ms = Some(sent_at.elapsed().as_millis() as u64);
+                }
+            }
         }
         _ => {}
     }
@@ -245,6 +248,7 @@ async fn run_session(
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(5));
     keepalive_interval.tick().await; // consume initial tick
     let mut last_pong = Instant::now();
+    let mut last_ping: Option<(u64, Instant)> = None;
     let mut last_rtt_ms: Option<u64> = None;
 
     // How long to hold an ambiguous lone-ESC (or other incomplete escape
@@ -260,7 +264,15 @@ async fn run_session(
                 biased;
 
                 // Local stdin → send to server (highest priority)
-                Some(data) = stdin_rx.recv() => {
+                data = stdin_rx.recv() => {
+                    let Some(data) = data else {
+                        // stdin closed (terminal gone / EOF) — detach rather
+                        // than lingering as an output-only client with no way
+                        // to send the detach chord.
+                        info!("stdin closed, detaching");
+                        exit_reason = ExitReason::Detached;
+                        break;
+                    };
                     let result = detach_filter.feed(&data);
                     if !result.forward.is_empty() {
                         write_frame_async(&mut writer, &C2S::RawInput { data: result.forward }).await?;
@@ -319,6 +331,7 @@ async fn run_session(
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    last_ping = Some((t, Instant::now()));
                     write_frame_async(&mut writer, &C2S::Ping { t }).await?;
                 }
 
@@ -329,12 +342,16 @@ async fn run_session(
                         None => std::future::pending().await,
                     }
                 } => {
+                    // Set when the info overlay was shown: screen diffs queued
+                    // behind it apply to the pre-overlay screen and would paint
+                    // garbage — drop them; the requested snapshot repaints.
+                    let mut drop_stale_diffs = false;
                     match msg {
                         Some(msg) => {
                             match handle_server_msg(
                                 msg, &mut stdout, &mut local_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
-                                &mut last_rtt_ms,
+                                &last_ping, &mut last_rtt_ms,
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;
@@ -363,6 +380,7 @@ async fn run_session(
                                     stdin_rx.recv().await;
                                     // Restore session screen
                                     write_frame_async(&mut writer, &C2S::RequestSnapshot).await?;
+                                    drop_stale_diffs = true;
                                 }
                                 MsgAction::Continue => {}
                             }
@@ -378,10 +396,13 @@ async fn run_session(
                     // to the terminal in a single flush.
                     if let Some(rx) = server_rx.as_mut() {
                         while let Ok(msg) = rx.try_recv() {
+                            if drop_stale_diffs && matches!(msg, S2C::ScreenDiff { .. }) {
+                                continue;
+                            }
                             match handle_server_msg(
                                 msg, &mut stdout, &mut local_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
-                                &mut last_rtt_ms,
+                                &last_ping, &mut last_rtt_ms,
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;

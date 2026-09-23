@@ -5,19 +5,26 @@ use serde::{Deserialize, Serialize};
 /// Maximum frame size: 16 MiB.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Write a length-prefixed postcard frame (sync).
-pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
-    let payload =
-        postcard::to_stdvec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let len = payload.len() as u32;
+/// Serialize a value into a single `length ‖ payload` buffer, so a frame
+/// goes out in one write (one syscall / one SSH packet) instead of two.
+fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut buf = postcard::to_extend(value, vec![0u8; 4])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len = (buf.len() - 4) as u32;
     if len > MAX_FRAME_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame exceeds MAX_FRAME_SIZE",
         ));
     }
-    writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(&payload)?;
+    buf[..4].copy_from_slice(&len.to_be_bytes());
+    Ok(buf)
+}
+
+/// Write a length-prefixed postcard frame (sync).
+pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
+    let buf = encode_frame(value)?;
+    writer.write_all(&buf)?;
     writer.flush()
 }
 
@@ -52,17 +59,8 @@ pub mod async_io {
         W: AsyncWriteExt + Unpin,
         T: Serialize,
     {
-        let payload = postcard::to_stdvec(value)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let len = payload.len() as u32;
-        if len > MAX_FRAME_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame exceeds MAX_FRAME_SIZE",
-            ));
-        }
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&payload).await?;
+        let buf = super::encode_frame(value)?;
+        writer.write_all(&buf).await?;
         writer.flush().await
     }
 
