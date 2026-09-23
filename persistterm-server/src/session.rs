@@ -32,6 +32,11 @@ struct ClientConn {
 /// Maximum number of kicked clients kept in the waiting queue.
 const MAX_WAITING_CLIENTS: usize = 8;
 
+/// Maximum time for a connecting client to complete the handshake (Hello →
+/// Welcome → initial screen). The handshake shares the session loop, so a
+/// stuck connection must not be allowed to block PTY draining indefinitely.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 /// A kicked client that is still connected and waiting to reclaim.
 struct WaitingClient {
     writer: tokio::io::WriteHalf<tokio::net::UnixStream>,
@@ -271,6 +276,8 @@ impl Session {
                             } else {
                                 self.terminal.reset_prev_screen();
                                 dirty = false;
+                                dirty_since = None;
+                                last_pty_at = None;
                             }
                         }
                         Some(C2S::Ping { t }) => {
@@ -297,6 +304,8 @@ impl Session {
                             } else {
                                 self.terminal.reset_prev_screen();
                                 dirty = false;
+                                dirty_since = None;
+                                last_pty_at = None;
                             }
                         }
                         Some(C2S::RequestSessionInfo) => {
@@ -486,8 +495,14 @@ impl Session {
                 result = self.listener.accept() => {
                     match result {
                         Ok(stream) => {
-                            match self.accept_client(stream).await {
-                                Ok(conn) => {
+                            // The handshake runs inline in the session loop; without
+                            // a timeout a wedged connection would stall PTY draining
+                            // until backpressure freezes the child process.
+                            match tokio::time::timeout(
+                                Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                                self.accept_client(stream),
+                            ).await {
+                                Ok(Ok(conn)) => {
                                     if let Some(mut old) = client.take() {
                                         let _ = write_frame_async(
                                             &mut old.writer,
@@ -501,9 +516,14 @@ impl Session {
                                     }
                                     client = Some(conn);
                                     dirty = false;
+                                    dirty_since = None;
+                                    last_pty_at = None;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!("client handshake failed: {e}");
+                                }
+                                Err(_) => {
+                                    warn!("client handshake timed out");
                                 }
                             }
                         }

@@ -427,6 +427,45 @@ enum OverlayAction {
     Exit,
 }
 
+/// A keypress interpreted for overlay prompts.
+enum OverlayKey {
+    Confirm,
+    Exit,
+    Other,
+}
+
+/// Classify a raw input chunk for overlay prompts. Escape sequences (arrow
+/// keys, KKP-encoded keys) are skipped rather than matched byte-by-byte, so
+/// pressing an arrow key (`ESC [ A`) no longer reads as ESC and exits the
+/// overlay. Only a lone ESC byte or a literal `q` means exit.
+fn classify_overlay_input(data: &[u8]) -> OverlayKey {
+    if data == [0x1b] {
+        return OverlayKey::Exit;
+    }
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            0x1b => {
+                // Skip the whole escape sequence: CSI runs to its final byte
+                // (0x40–0x7E); other introducers (SS3 etc.) are skipped as a
+                // two-byte prefix and their final byte falls through harmlessly.
+                i += 1;
+                if i < data.len() && data[i] == b'[' {
+                    i += 1;
+                    while i < data.len() && !(0x40..=0x7e).contains(&data[i]) {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            0x20 | 0x0d | 0x0a => return OverlayKey::Confirm,
+            b'q' => return OverlayKey::Exit,
+            _ => i += 1,
+        }
+    }
+    OverlayKey::Other
+}
+
 /// Wait for overlay input or server notification (auto-reclaim).
 async fn wait_for_overlay_action(
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -437,14 +476,12 @@ async fn wait_for_overlay_action(
         tokio::select! {
             data = stdin_rx.recv() => {
                 if let Some(data) = data {
-                    for &b in &data {
-                        match b {
-                            // Space or Enter → reconnect
-                            0x20 | 0x0d | 0x0a => return OverlayAction::Reconnect,
-                            // 'q' or Esc → exit
-                            b'q' | 0x1b => return OverlayAction::Exit,
-                            _ => {}
-                        }
+                    match classify_overlay_input(&data) {
+                        // Space or Enter → reconnect
+                        OverlayKey::Confirm => return OverlayAction::Reconnect,
+                        // 'q' or lone Esc → exit
+                        OverlayKey::Exit => return OverlayAction::Exit,
+                        OverlayKey::Other => {}
                     }
                 } else {
                     // stdin closed
@@ -580,17 +617,13 @@ async fn wait_for_manual_action(
 ) -> ReconnectAction {
     loop {
         match stdin_rx.recv().await {
-            Some(data) => {
-                for &b in &data {
-                    match b {
-                        // Space or Enter → retry
-                        0x20 | 0x0d | 0x0a => return ReconnectAction::Retry,
-                        // q or Esc → exit
-                        b'q' | 0x1b => return ReconnectAction::Exit,
-                        _ => {}
-                    }
-                }
-            }
+            Some(data) => match classify_overlay_input(&data) {
+                // Space or Enter → retry
+                OverlayKey::Confirm => return ReconnectAction::Retry,
+                // q or lone Esc → exit
+                OverlayKey::Exit => return ReconnectAction::Exit,
+                OverlayKey::Other => {}
+            },
             None => return ReconnectAction::Exit,
         }
     }
@@ -619,14 +652,12 @@ async fn show_reconnect_overlay(
         tokio::select! {
             data = stdin_rx.recv() => {
                 if let Some(data) = data {
-                    for &b in &data {
-                        match b {
-                            // Enter or Space → retry now
-                            0x0d | 0x0a | 0x20 => return ReconnectAction::Retry,
-                            // q or Esc → exit
-                            b'q' | 0x1b => return ReconnectAction::Exit,
-                            _ => {}
-                        }
+                    match classify_overlay_input(&data) {
+                        // Enter or Space → retry now
+                        OverlayKey::Confirm => return ReconnectAction::Retry,
+                        // q or lone Esc → exit
+                        OverlayKey::Exit => return ReconnectAction::Exit,
+                        OverlayKey::Other => {}
                     }
                 } else {
                     return ReconnectAction::Exit;
@@ -742,4 +773,43 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
     cleanup_terminal(session, &result);
 
     result.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_overlay_input, OverlayKey};
+
+    #[test]
+    fn lone_esc_exits() {
+        assert!(matches!(classify_overlay_input(&[0x1b]), OverlayKey::Exit));
+    }
+
+    #[test]
+    fn arrow_key_is_ignored() {
+        assert!(matches!(classify_overlay_input(b"\x1b[A"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn plain_keys_classify() {
+        assert!(matches!(classify_overlay_input(b"q"), OverlayKey::Exit));
+        assert!(matches!(classify_overlay_input(b"\r"), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b"\n"), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b" "), OverlayKey::Confirm));
+        assert!(matches!(classify_overlay_input(b"x"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn escape_sequences_are_skipped_whole() {
+        // KKP-encoded 'q' must not exit
+        assert!(matches!(classify_overlay_input(b"\x1b[113u"), OverlayKey::Other));
+        // Mouse SGR report (contains a space-free param region + final byte)
+        assert!(matches!(classify_overlay_input(b"\x1b[<0;33;22M"), OverlayKey::Other));
+        // SS3 arrow
+        assert!(matches!(classify_overlay_input(b"\x1bOA"), OverlayKey::Other));
+    }
+
+    #[test]
+    fn key_after_sequence_still_counts() {
+        assert!(matches!(classify_overlay_input(b"\x1b[A\r"), OverlayKey::Confirm));
+    }
 }

@@ -63,6 +63,9 @@ pub struct Terminal {
     dec_modes: BTreeSet<u16>,
     /// Buffer for OSC sequences that span multiple PTY read chunks.
     pending_osc: Vec<u8>,
+    /// Trailing partial escape sequence carried over from the previous chunk,
+    /// so KKP/DEC-mode sequences split across PTY reads are still detected.
+    pending_esc: Vec<u8>,
     /// Previous frame for computing diffs.
     prev_frame: Option<PrevFrame>,
     /// Whether the application has an active synchronized update (DEC mode 2026).
@@ -95,6 +98,7 @@ impl Terminal {
             kkp_stack: Vec::new(),
             dec_modes: BTreeSet::new(),
             pending_osc: Vec::new(),
+            pending_esc: Vec::new(),
             prev_frame: None,
             app_sync_active: false,
             size: (rows, cols),
@@ -106,16 +110,29 @@ impl Terminal {
     pub fn process(&mut self, data: &[u8]) -> PtyEvents {
         let old_kkp = self.kkp_flags();
 
-        // Scan for KKP/DEC/OSC changes (detection only)
+        // Scan for KKP/DEC/OSC changes (detection only). Prepend any partial
+        // escape sequence carried over from the previous chunk so sequences
+        // split across PTY reads are still detected. The emulator below gets
+        // the raw bytes — it keeps its own parser state across chunks.
         let mut client_forwards = Vec::new();
         let mut dec_mode_changes = Vec::new();
+        let stitched;
+        let scan_data: &[u8] = if self.pending_esc.is_empty() {
+            data
+        } else {
+            let mut buf = std::mem::take(&mut self.pending_esc);
+            buf.extend_from_slice(data);
+            stitched = buf;
+            &stitched
+        };
         scan_pty_output(
-            data,
+            scan_data,
             &mut self.kkp_stack,
             &mut self.dec_modes,
             &mut dec_mode_changes,
             &mut client_forwards,
             &mut self.pending_osc,
+            &mut self.pending_esc,
             &mut self.app_sync_active,
         );
 
@@ -801,7 +818,29 @@ fn handle_osc(body: &[u8], client_forwards: &mut Vec<Vec<u8>>) {
     }
 }
 
+/// Maximum length of a partial escape sequence carried between chunks.
+/// The sequences we detect (KKP, DEC private modes) have short parameter
+/// lists; anything longer is garbage and not worth tracking.
+const MAX_PENDING_ESC: usize = 64;
+
+/// True if `rest` (which starts with ESC and runs to the end of the chunk)
+/// is an incomplete prefix of a sequence the scanner cares about, and should
+/// be carried over to the next chunk.
+fn is_partial_escape(rest: &[u8]) -> bool {
+    match rest {
+        // Lone ESC, "ESC [", or "ESC ]" at the very end of the chunk.
+        [0x1b] | [0x1b, b'['] | [0x1b, b']'] => true,
+        // CSI with a private marker we track, params still incomplete.
+        [0x1b, b'[', marker, params @ ..] => {
+            matches!(marker, b'?' | b'>' | b'<' | b'=')
+                && params.iter().all(|&b| b.is_ascii_digit() || b == b';')
+        }
+        _ => false,
+    }
+}
+
 /// Scan PTY output for KKP sequences, DEC private mode changes, and OSC clipboard.
+#[allow(clippy::too_many_arguments)]
 fn scan_pty_output(
     data: &[u8],
     kkp_stack: &mut Vec<u32>,
@@ -809,6 +848,7 @@ fn scan_pty_output(
     dec_mode_changes: &mut Vec<(u16, bool)>,
     client_forwards: &mut Vec<Vec<u8>>,
     pending_osc: &mut Vec<u8>,
+    pending_esc: &mut Vec<u8>,
     app_sync_active: &mut bool,
 ) {
     let mut i = 0;
@@ -844,6 +884,17 @@ fn scan_pty_output(
     }
 
     while i < data.len() {
+        // Chunk ends in an incomplete sequence we track — carry it over so
+        // the next chunk can complete it. Oversized partials are dropped
+        // (bounded memory; wezterm still handles the emulation side).
+        if data[i] == 0x1b && is_partial_escape(&data[i..]) {
+            let tail = &data[i..];
+            if tail.len() <= MAX_PENDING_ESC {
+                pending_esc.extend_from_slice(tail);
+            }
+            break;
+        }
+
         if data[i] == 0x1b
             && i + 1 < data.len()
             && data[i + 1] == b'['
@@ -996,4 +1047,84 @@ fn simple_hash(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Terminal, MAX_KKP_STACK};
+
+    fn term() -> Terminal {
+        Terminal::new(24, 80, Box::new(std::io::sink()))
+    }
+
+    #[test]
+    fn dec_mode_detected_in_single_chunk() {
+        let mut t = term();
+        let ev = t.process(b"\x1b[?1000h");
+        assert_eq!(ev.dec_mode_changes, vec![(1000, true)]);
+    }
+
+    #[test]
+    fn dec_mode_split_across_chunks() {
+        let mut t = term();
+        let ev1 = t.process(b"\x1b[?10");
+        assert!(ev1.dec_mode_changes.is_empty());
+        let ev2 = t.process(b"00h");
+        assert_eq!(ev2.dec_mode_changes, vec![(1000, true)]);
+    }
+
+    #[test]
+    fn dec_mode_split_at_esc() {
+        let mut t = term();
+        t.process(b"\x1b");
+        let ev = t.process(b"[?2004h");
+        assert_eq!(ev.dec_mode_changes, vec![(2004, true)]);
+    }
+
+    #[test]
+    fn kkp_push_split_across_chunks() {
+        let mut t = term();
+        let ev1 = t.process(b"\x1b[>1");
+        assert!(ev1.kkp_changed.is_none());
+        let ev2 = t.process(b"u");
+        assert_eq!(ev2.kkp_changed, Some(1));
+    }
+
+    #[test]
+    fn untracked_sequence_split_is_harmless() {
+        let mut t = term();
+        t.process(b"\x1b");
+        let ev = t.process(b"[Ahello");
+        assert!(ev.dec_mode_changes.is_empty());
+        assert!(ev.kkp_changed.is_none());
+    }
+
+    #[test]
+    fn osc52_split_after_introducer() {
+        let mut t = term();
+        t.process(b"\x1b]");
+        let ev = t.process(b"52;c;QUJD\x07");
+        assert_eq!(ev.osc_forwards, vec![b"52;c;QUJD".to_vec()]);
+    }
+
+    #[test]
+    fn osc52_split_mid_body() {
+        let mut t = term();
+        let ev1 = t.process(b"\x1b]52;c;QU");
+        assert!(ev1.osc_forwards.is_empty());
+        let ev2 = t.process(b"JD\x07");
+        assert_eq!(ev2.osc_forwards, vec![b"52;c;QUJD".to_vec()]);
+    }
+
+    #[test]
+    fn kkp_stack_is_capped() {
+        let mut t = term();
+        for _ in 0..(MAX_KKP_STACK + 10) {
+            t.process(b"\x1b[>1u");
+        }
+        assert!(t.kkp_stack.len() <= MAX_KKP_STACK);
+        // Eviction drops the oldest entry; the latest push still lands on top.
+        let ev = t.process(b"\x1b[>2u");
+        assert_eq!(ev.kkp_changed, Some(2));
+    }
 }
