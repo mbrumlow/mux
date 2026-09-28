@@ -191,16 +191,21 @@ fn reencode_csi_u(ev: &KkpEvent, inner_flags: u32, out: &mut Vec<u8>) {
             }
             return;
         }
-        let produced = if shift_only {
-            // Without the shifted character we can only be sure for ASCII
-            // letters; anything else is layout-dependent, so fall through to
-            // CSI-u rather than send the wrong character.
-            ev.shifted_key.or(match keycode {
+        let produced = match (ev.shifted_key, shift_only) {
+            // A shifted key is reported only when shift was held, so it is
+            // the character this press produced. WezTerm names it without
+            // also setting the shift bit in the modifier field, so this has
+            // to be believed whatever the modifiers say -- otherwise
+            // shift+/ arrives as / and shift+, as a comma.
+            (Some(shifted), _) => Some(shifted),
+            // Shift held but nothing named: only ASCII letters are safe to
+            // work out, anything else is layout-dependent, so fall through
+            // to CSI-u rather than send the wrong character.
+            (None, true) => match keycode {
                 c @ 0x61..=0x7A => Some(c - 32),
                 _ => None,
-            })
-        } else {
-            Some(keycode)
+            },
+            (None, false) => Some(keycode),
         };
         if let Some(cp) = produced {
             if is_printable_codepoint(cp) {
@@ -513,6 +518,30 @@ mod tests {
         t.set_inner_flags(1);
         let result = t.translate(b"\x1b[97:65;2u");
         assert_eq!(result, b"A");
+    }
+
+    #[test]
+    fn wezterm_shifted_key_without_shift_bit() {
+        // Exactly what WezTerm sends for shift+/ : the shifted character is
+        // named, but the modifier field says 1 (no modifiers).
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1 | REPORT_ALTERNATE_KEYS); // flags=5, as kkp.el asks for
+        assert_eq!(t.translate(b"\x1b[47:63;1u"), b"?");
+        assert_eq!(t.translate(b"\x1b[44:60;1u"), b"<");
+        assert_eq!(t.translate(b"\x1b[46:62;1u"), b">");
+        assert_eq!(t.translate(b"\x1b[97:65;1u"), b"A");
+        // ...and the same keys unshifted still come through as themselves.
+        assert_eq!(t.translate(b"\x1b[47;1u"), b"/");
+        assert_eq!(t.translate(b"\x1b[44;1u"), b",");
+    }
+
+    #[test]
+    fn ctrl_keys_are_untouched_by_the_shifted_key_rule() {
+        // From the same session: ctrl+/ and ctrl+x stay escape sequences.
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1 | REPORT_ALTERNATE_KEYS);
+        assert_eq!(t.translate(b"\x1b[47;5u"), b"\x1b[47;5u");
+        assert_eq!(t.translate(b"\x1b[120;5u"), b"\x1b[120;5u");
     }
 
     #[test]
