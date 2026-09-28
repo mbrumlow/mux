@@ -161,15 +161,53 @@ fn reencode_csi_u(ev: &KkpEvent, inner_flags: u32, out: &mut Vec<u8>) {
 
     let modifiers = ev.modifiers;
     let has_modifiers = modifiers != 1;
+    let modifier_bits = modifiers.wrapping_sub(1);
+    // Shift is part of producing text, so it does not on its own turn a key
+    // into an escape sequence: a terminal that has not been asked for
+    // REPORT_ALL_KEYS_AS_ESCAPE_CODES sends "A" for shift+a and "<" for
+    // shift+comma, the same as it sends "a" and ",". Only modifiers beyond
+    // shift force CSI-u. Passing these on as CSI-u instead left the inner
+    // app to work out the shifted character from the alternate-key field,
+    // which it can only do while REPORT_ALTERNATE_KEYS is in force -- and
+    // when it is not, every shifted key arrives as its unshifted character.
+    let shift_only = modifier_bits == 1;
 
-    // Unmodified printable key → emit plain UTF-8 if inner doesn't want all-keys
-    if !has_modifiers
+    // Text-producing key → emit the text itself if inner doesn't want all-keys
+    if (!has_modifiers || shift_only)
         && dominated_press(ev.event_type, inner_flags)
         && (inner_flags & REPORT_ALL_KEYS_AS_ESCAPE_CODES) == 0
-        && is_printable_codepoint(keycode)
     {
-        encode_utf8(keycode, out);
-        return;
+        // Prefer the text the outer terminal reported, then the shifted key
+        // it named. With no shift there is nothing to resolve and the
+        // keycode is the character.
+        if !ev.text_codepoints.is_empty()
+            && ev
+                .text_codepoints
+                .iter()
+                .all(|&cp| is_printable_codepoint(cp))
+        {
+            for &cp in &ev.text_codepoints {
+                encode_utf8(cp, out);
+            }
+            return;
+        }
+        let produced = if shift_only {
+            // Without the shifted character we can only be sure for ASCII
+            // letters; anything else is layout-dependent, so fall through to
+            // CSI-u rather than send the wrong character.
+            ev.shifted_key.or(match keycode {
+                c @ 0x61..=0x7A => Some(c - 32),
+                _ => None,
+            })
+        } else {
+            Some(keycode)
+        };
+        if let Some(cp) = produced {
+            if is_printable_codepoint(cp) {
+                encode_utf8(cp, out);
+                return;
+            }
+        }
     }
 
     // Build CSI-u sequence
@@ -467,13 +505,64 @@ mod tests {
     }
 
     #[test]
-    fn alternate_key_stripped_at_flags_1() {
-        // \x1b[97:65;2u = 'a' with shifted_key=65('A'), Shift modifier
-        // At flags=1 (no REPORT_ALTERNATE_KEYS), strip alternate key info
+    fn shift_letter_is_sent_as_text_at_flags_1() {
+        // \x1b[97:65;2u = 'a' with shifted_key=65('A'), Shift modifier.
+        // Shift alone does not make a key an escape sequence: a terminal at
+        // flags=1 sends the character the key produced.
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1);
         let result = t.translate(b"\x1b[97:65;2u");
-        assert_eq!(result, b"\x1b[97;2u");
+        assert_eq!(result, b"A");
+    }
+
+    #[test]
+    fn shift_punctuation_is_sent_as_text_at_flags_1() {
+        // shift+comma: keycode 44 (','), shifted_key 60 ('<').
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1);
+        assert_eq!(t.translate(b"\x1b[44:60;2u"), b"<");
+        // shift+period: 46 ('.') / 62 ('>').
+        assert_eq!(t.translate(b"\x1b[46:62;2u"), b">");
+        // shift+slash: 47 ('/') / 63 ('?').
+        assert_eq!(t.translate(b"\x1b[47:63;2u"), b"?");
+    }
+
+    #[test]
+    fn shift_text_survives_flags_without_alternate_keys() {
+        // The same keys must reach the app whatever the inner flags are:
+        // they no longer travel as CSI-u, so the app never has to recover
+        // the shifted character from an alternate-key field.
+        for flags in [1u32, 1 | REPORT_ALTERNATE_KEYS, 1 | REPORT_EVENT_TYPES] {
+            let mut t = KkpTranslator::new();
+            t.set_inner_flags(flags);
+            assert_eq!(t.translate(b"\x1b[44:60;2u"), b"<", "flags={flags}");
+        }
+    }
+
+    #[test]
+    fn shift_punctuation_without_alternate_key_stays_csi_u() {
+        // Nothing names the shifted character, and what shift produces from
+        // a comma is layout-dependent, so guessing is worse than passing the
+        // sequence along.
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1);
+        assert_eq!(t.translate(b"\x1b[44;2u"), b"\x1b[44;2u");
+    }
+
+    #[test]
+    fn shift_with_another_modifier_stays_csi_u() {
+        // Ctrl+Shift+a is not a text-producing key.
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1);
+        assert_eq!(t.translate(b"\x1b[97:65;6u"), b"\x1b[97;6u");
+    }
+
+    #[test]
+    fn shift_text_stays_csi_u_when_inner_wants_all_keys() {
+        // An app that asked for every key as an escape code gets them.
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1 | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        assert_eq!(t.translate(b"\x1b[97:65;2u"), b"\x1b[97:65;2u");
     }
 
     #[test]
@@ -582,19 +671,30 @@ mod tests {
 
     #[test]
     fn alternate_keys_preserved_when_inner_wants_them() {
+        // A key that shift does not turn into text: ctrl+shift+a keeps the
+        // alternate-key field when the inner app asked for it.
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1 | REPORT_ALTERNATE_KEYS); // flags=5
-        let result = t.translate(b"\x1b[97:65;2u");
-        assert_eq!(result, b"\x1b[97:65;2u");
+        let result = t.translate(b"\x1b[97:65;6u");
+        assert_eq!(result, b"\x1b[97:65;6u");
+    }
+
+    #[test]
+    fn reported_text_is_used_for_shifted_keys() {
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1);
+        // 'a' with Shift, text='A': \x1b[97;2;65u -> the text it produced.
+        let result = t.translate(b"\x1b[97;2;65u");
+        assert_eq!(result, b"A");
     }
 
     #[test]
     fn text_codepoints_stripped_when_not_wanted() {
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1);
-        // 'a' with Shift, text='A': \x1b[97;2;65u
-        let result = t.translate(b"\x1b[97;2;65u");
-        assert_eq!(result, b"\x1b[97;2u");
+        // Ctrl+Shift+a with text: not text-producing, so the text field goes.
+        let result = t.translate(b"\x1b[97;6;65u");
+        assert_eq!(result, b"\x1b[97;6u");
     }
 
     #[test]
@@ -612,8 +712,19 @@ mod tests {
     fn text_codepoints_preserved_when_wanted() {
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1 | REPORT_ASSOCIATED_TEXT); // flags=17
-        let result = t.translate(b"\x1b[97;2;65u");
-        assert_eq!(result, b"\x1b[97;2;65u");
+        // A key that still travels as CSI-u keeps its text field: shift alone
+        // would have made this text, so use a modifier that does not.
+        let result = t.translate(b"\x1b[97;6;65u");
+        assert_eq!(result, b"\x1b[97;6;65u");
+    }
+
+    #[test]
+    fn shift_text_is_text_even_when_text_reporting_is_on() {
+        // REPORT_ASSOCIATED_TEXT says how escape codes carry their text; it
+        // does not turn a text-producing key into an escape code.
+        let mut t = KkpTranslator::new();
+        t.set_inner_flags(1 | REPORT_ASSOCIATED_TEXT);
+        assert_eq!(t.translate(b"\x1b[97;2;65u"), b"A");
     }
 
     #[test]
