@@ -153,9 +153,21 @@ pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, 
     })
 }
 
+/// Generate a 256-bit random token as a 64-char hex string.
+fn generate_browser_token() -> Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .context("failed to open /dev/urandom")?;
+    f.read_exact(&mut buf)
+        .context("failed to read from /dev/urandom")?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Run the server in the current process (called by `mux server --session <name>`).
 pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Result<()> {
     let sock = paths::socket_path(name);
+    let browser_sock = paths::browser_socket_path(name);
 
     let config = Config::load();
     let resolved_program = config.resolve_program(program);
@@ -168,6 +180,21 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
         paths::agent_link_path(name).to_string_lossy().into_owned(),
     ));
 
+    // Generate browser sideband token and wire environment
+    let browser_token = generate_browser_token()?;
+    extra_env.push((
+        "MUX_BROWSER_SOCKET".to_string(),
+        browser_sock.to_string_lossy().into_owned(),
+    ));
+    extra_env.push((
+        "MUX_BROWSER_TOKEN".to_string(),
+        browser_token.clone(),
+    ));
+    extra_env.push((
+        "BROWSER".to_string(),
+        "mux open-url".to_string(),
+    ));
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -177,6 +204,7 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
         info!(?sock, rows, cols, "starting server for session {name}");
         let mut session = persistterm_server::session::Session::new(
             name, rows, cols, &sock, &resolved_program, &extra_env,
+            Some(&browser_sock), &browser_token,
         )?;
         session.run().await
     })

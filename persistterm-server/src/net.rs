@@ -34,11 +34,17 @@ impl Drop for Listener {
         let lock_path = self.path.with_extension("lock");
         let _ = std::fs::remove_file(lock_path);
         // Clean up the SSH agent symlink (e.g. "mysession.agent.sock")
+        // and browser sideband socket (e.g. "mysession.browser.sock")
         if let Some(stem) = self.path.file_stem() {
+            let stem = stem.to_string_lossy();
             let agent_path = self.path.with_file_name(
-                format!("{}.agent.sock", stem.to_string_lossy()),
+                format!("{stem}.agent.sock"),
             );
             let _ = std::fs::remove_file(agent_path);
+            let browser_path = self.path.with_file_name(
+                format!("{stem}.browser.sock"),
+            );
+            let _ = std::fs::remove_file(browser_path);
         }
     }
 }

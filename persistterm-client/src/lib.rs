@@ -161,6 +161,20 @@ fn handle_server_msg(
                 }
             }
         }
+        S2C::OpenUrl { url } => {
+            // Fire-and-forget: open URL in the client's local browser
+            let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            match std::process::Command::new(cmd)
+                .arg(&url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => info!(url, "opened URL in local browser"),
+                Err(e) => error!(url, "failed to open URL: {e}"),
+            }
+        }
         _ => {}
     }
     Ok(MsgAction::Continue)

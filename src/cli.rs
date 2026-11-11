@@ -57,6 +57,11 @@ pub enum Commands {
         #[arg(last = true)]
         program: Vec<String>,
     },
+    /// Internal: open a URL via the browser sideband channel
+    #[command(hide = true, name = "open-url")]
+    OpenUrl {
+        url: String,
+    },
 }
 
 pub enum SessionTarget {

@@ -29,7 +29,8 @@ pub fn list_sessions() -> Result<()> {
             .unwrap_or("???");
 
         // Skip agent symlinks (e.g. "mysession.agent.sock")
-        if name.ends_with(".agent") {
+        // and browser sideband sockets (e.g. "mysession.browser.sock")
+        if name.ends_with(".agent") || name.ends_with(".browser") {
             continue;
         }
 
@@ -107,6 +108,7 @@ pub fn kill_session(name: &str) -> Result<()> {
     let lock_path = paths::socket_dir().join(format!("{name}.lock"));
     let _ = std::fs::remove_file(lock_path);
     paths::remove_agent_link(name);
+    paths::remove_browser_socket(name);
 
     eprintln!("killed session '{name}'");
     Ok(())

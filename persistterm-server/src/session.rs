@@ -168,6 +168,8 @@ pub struct Session {
     pty_writer: ChannelWriter,
     terminal: Terminal,
     listener: Listener,
+    browser_listener: Option<Listener>,
+    browser_token: String,
     pty_rx: mpsc::Receiver<Box<[u8]>>,
     started_at: Instant,
     program: Vec<String>,
@@ -181,12 +183,25 @@ impl Session {
         sock_path: &Path,
         program: &[String],
         extra_env: &[(String, String)],
+        browser_sock_path: Option<&Path>,
+        browser_token: &str,
     ) -> Result<Self> {
         let (pty, pty_reader, pty_writer) = PtyHandle::spawn(rows, cols, program, name, extra_env)?;
         let channel_writer = ChannelWriter::spawn(pty_writer);
         let term_writer = channel_writer.clone_boxed();
         let terminal = Terminal::new(rows, cols, term_writer);
         let listener = Listener::bind(sock_path)?;
+
+        let browser_listener = match browser_sock_path {
+            Some(p) => match Listener::bind(p) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    warn!("failed to bind browser socket: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
 
         // Spawn blocking reader for PTY output
         let (pty_tx, pty_rx) = mpsc::channel::<Box<[u8]>>(256);
@@ -200,10 +215,75 @@ impl Session {
             pty_writer: channel_writer,
             terminal,
             listener,
+            browser_listener,
+            browser_token: browser_token.to_string(),
             pty_rx,
             started_at: Instant::now(),
             program: program.to_vec(),
         })
+    }
+
+    /// Handle a single browser sideband connection: read the request line,
+    /// validate token and URL, respond OK/ERR, and return the URL on success.
+    async fn handle_browser_conn(
+        stream: tokio::net::UnixStream,
+        expected_token: &str,
+    ) -> Option<String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut buf_reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+
+            // Read at most 8KB + token size to prevent memory exhaustion
+            let max_len = 8192 + expected_token.len() + 2;
+            let n = (&mut buf_reader).take(max_len as u64).read_line(&mut line).await;
+            match n {
+                Ok(0) | Err(_) => {
+                    let _ = writer.write_all(b"ERR bad request\n").await;
+                    return None;
+                }
+                Ok(_) => {}
+            }
+
+            let line = line.trim_end();
+            let (token, url) = match line.split_once(' ') {
+                Some(pair) => pair,
+                None => {
+                    let _ = writer.write_all(b"ERR bad format\n").await;
+                    return None;
+                }
+            };
+
+            // Constant-time token comparison
+            if !constant_time_eq(token.as_bytes(), expected_token.as_bytes()) {
+                let _ = writer.write_all(b"ERR bad token\n").await;
+                return None;
+            }
+
+            // Validate URL: must be http or https, max 8KB
+            if url.len() > 8192 {
+                let _ = writer.write_all(b"ERR url too long\n").await;
+                return None;
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                let _ = writer.write_all(b"ERR invalid scheme\n").await;
+                return None;
+            }
+
+            let _ = writer.write_all(b"OK\n").await;
+            Some(url.to_string())
+        })
+        .await;
+
+        match result {
+            Ok(url) => url,
+            Err(_) => {
+                warn!("browser request timed out");
+                None
+            }
+        }
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -539,6 +619,38 @@ impl Session {
                         }
                     }
                 }
+
+                // ── Browser sideband: open-url requests (lowest priority) ──
+                result = async {
+                    match self.browser_listener.as_ref() {
+                        Some(l) => l.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(stream) => {
+                            if let Some(url) = Self::handle_browser_conn(stream, &self.browser_token).await {
+                                if let Some(conn) = client.as_mut() {
+                                    if let Err(e) = write_frame_async(
+                                        &mut conn.writer,
+                                        &S2C::OpenUrl { url: url.clone() },
+                                    ).await {
+                                        warn!("failed to send OpenUrl, dropping client: {e}");
+                                        drop(client.take());
+                                        notify_next_waiting(&mut waiting).await;
+                                    } else {
+                                        info!(url, "forwarded browser open-url to client");
+                                    }
+                                } else {
+                                    warn!(url, "browser open-url request but no client attached");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("browser socket accept error: {e}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -661,6 +773,18 @@ impl Session {
             connected_at: Instant::now(),
         })
     }
+}
+
+/// Constant-time byte comparison to prevent timing side-channels on token auth.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn read_pty_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Box<[u8]>>) {

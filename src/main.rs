@@ -4,7 +4,7 @@ mod daemon;
 mod paths;
 mod session_mgmt;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -18,6 +18,37 @@ fn default_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("off,mux=info,persistterm_server=info,persistterm_client=info,persistterm_proto=info")
     })
+}
+
+/// Send a URL open request to the browser sideband socket.
+/// This is a synchronous helper (no tokio) invoked by `mux open-url <url>`.
+fn open_url(url: &str) -> Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock_path = std::env::var("MUX_BROWSER_SOCKET")
+        .context("MUX_BROWSER_SOCKET not set — not inside a mux session?")?;
+    let token = std::env::var("MUX_BROWSER_TOKEN")
+        .context("MUX_BROWSER_TOKEN not set — not inside a mux session?")?;
+
+    let mut stream = UnixStream::connect(&sock_path)
+        .with_context(|| format!("failed to connect to browser socket at {sock_path}"))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+
+    write!(stream, "{token} {url}\n")?;
+    stream.flush()?;
+
+    let mut reader = std::io::BufReader::new(&stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+
+    let response = response.trim();
+    if response == "OK" {
+        Ok(())
+    } else {
+        anyhow::bail!("browser socket rejected request: {response}");
+    }
 }
 
 fn main() -> Result<()> {
@@ -40,6 +71,7 @@ fn main() -> Result<()> {
             let initial_size = cols.zip(*rows);
             daemon::run_bridge(session, program, initial_size)
         }
+        Some(Commands::OpenUrl { url }) => open_url(url),
         None if cli.list => session_mgmt::list_sessions(),
         None if cli.kill.is_some() => {
             let name = cli.kill.as_ref().unwrap();

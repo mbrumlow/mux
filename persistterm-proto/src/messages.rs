@@ -53,4 +53,5 @@ pub enum S2C {
     },
     SessionAvailable,
     SessionEnded,
+    OpenUrl { url: String },
 }

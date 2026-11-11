@@ -93,6 +93,11 @@ pub fn ensure_dirs() -> Result<()> {
     Ok(())
 }
 
+/// Socket path for the browser sideband channel for a named session.
+pub fn browser_socket_path(name: &str) -> PathBuf {
+    socket_dir().join(format!("{name}.browser.sock"))
+}
+
 /// Stable symlink path for SSH agent forwarding for a named session.
 pub fn agent_link_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{name}.agent.sock"))
@@ -138,6 +143,12 @@ pub fn update_agent_link(name: &str) -> Result<bool> {
 /// Best-effort removal of the stable agent symlink for a session.
 pub fn remove_agent_link(name: &str) {
     let link = agent_link_path(name);
+    let _ = fs::remove_file(&link);
+}
+
+/// Best-effort removal of the browser sideband socket for a session.
+pub fn remove_browser_socket(name: &str) {
+    let link = browser_socket_path(name);
     let _ = fs::remove_file(&link);
 }
 
