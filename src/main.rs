@@ -52,6 +52,18 @@ fn open_url(url: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Invoked through the `mux-open-url` symlink ($BROWSER helper): the URL is
+    // the first argument and there is nothing else to parse.
+    let mut args = std::env::args_os();
+    let invoked_as = args.next().map(std::path::PathBuf::from);
+    if invoked_as.as_deref().and_then(|p| p.file_name())
+        == Some(std::ffi::OsStr::new(paths::BROWSER_HELPER_NAME))
+    {
+        let url = args.next().context("usage: mux-open-url <url>")?;
+        let url = url.to_str().context("URL is not valid UTF-8")?;
+        return open_url(url);
+    }
+
     let cli = Cli::parse();
 
     match &cli.command {

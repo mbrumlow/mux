@@ -98,6 +98,30 @@ pub fn browser_socket_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{name}.browser.sock"))
 }
 
+/// Path of the single-word `$BROWSER` helper: a symlink to the mux binary
+/// named `mux-open-url`. Shared by all sessions.
+pub fn browser_helper_path() -> PathBuf {
+    socket_dir().join(BROWSER_HELPER_NAME)
+}
+
+/// File name mux is invoked under when acting as the `$BROWSER` helper.
+pub const BROWSER_HELPER_NAME: &str = "mux-open-url";
+
+/// Create (or refresh) the `$BROWSER` helper symlink pointing at this binary.
+pub fn ensure_browser_helper() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("failed to get current exe")?;
+    let link = browser_helper_path();
+    // Symlink under a temp name, then rename, so concurrent servers never
+    // observe a missing helper.
+    let tmp = link.with_extension(format!("tmp{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&exe, &tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    fs::rename(&tmp, &link)
+        .with_context(|| format!("failed to create {}", link.display()))?;
+    Ok(link)
+}
+
 /// Stable symlink path for SSH agent forwarding for a named session.
 pub fn agent_link_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{name}.agent.sock"))

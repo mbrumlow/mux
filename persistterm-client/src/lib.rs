@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use persistterm_proto::codec::async_io::{read_frame_async, write_frame_async};
 use persistterm_proto::{C2S, ClientCapabilities, S2C};
@@ -811,7 +811,7 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             }
             Err(e) => {
                 attempt += 1;
-                info!("SSH connection failed (attempt {attempt}): {e}");
+                warn!("SSH connection failed (attempt {attempt}): {e:#}");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
                     ReconnectAction::Retry => continue,
                     ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
@@ -845,7 +845,7 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             }
             Err(e) => {
                 attempt += 1;
-                info!("session error (attempt {attempt}): {e}");
+                warn!("session error (attempt {attempt}): {e:#}");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
                     ReconnectAction::Retry => continue,
                     ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),

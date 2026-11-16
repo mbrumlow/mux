@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::paths;
@@ -190,10 +190,17 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
         "MUX_BROWSER_TOKEN".to_string(),
         browser_token.clone(),
     ));
-    extra_env.push((
-        "BROWSER".to_string(),
-        "mux open-url".to_string(),
-    ));
+    // $BROWSER must be a single executable path: many consumers (notably
+    // Python's `webbrowser`, used by the AWS CLI) exec the whole value as one
+    // program name rather than splitting it into command + arguments.
+    let browser_cmd = match paths::ensure_browser_helper() {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            warn!("falling back to BROWSER=\"mux open-url\": {e:#}");
+            "mux open-url".to_string()
+        }
+    };
+    extra_env.push(("BROWSER".to_string(), browser_cmd));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
