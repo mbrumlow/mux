@@ -139,6 +139,7 @@ pub fn attach_remote(host: &str, session: &str, program: &[String]) -> Result<()
     let config = crate::config::Config::load();
     let ssh_options = persistterm_client::ssh::SshOptions {
         compression: config.ssh.compression,
+        forward_callbacks: config.ssh.forward_callbacks,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

@@ -128,6 +128,10 @@ EMACS_SOCKET_NAME = "$MUX_SESSION"
 [ssh]
 # Enable zlib compression on the SSH transport.
 compression = false
+# When a URL opened from a remote session contains a loopback callback
+# (e.g. redirect_uri=http://127.0.0.1:PORT/... from `aws login`), listen on
+# that port locally for 5 minutes and relay it to the remote host over SSH.
+forward_callbacks = true
 ```
 
 ### Environment variables
