@@ -2420,6 +2420,7 @@ dependencies = [
  "russh",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

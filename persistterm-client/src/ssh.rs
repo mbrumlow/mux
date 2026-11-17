@@ -12,6 +12,44 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[derive(Default)]
 pub struct SshOptions {
     pub compression: bool,
+    /// Relay loopback auth callbacks (see `forward`) back to the remote host.
+    pub forward_callbacks: bool,
+}
+
+/// An established connection to a remote `mux bridge`.
+pub struct SshConn {
+    pub reader: Box<dyn AsyncRead + Unpin + Send>,
+    pub writer: Box<dyn AsyncWrite + Unpin + Send>,
+    /// Present when callback forwarding is enabled.
+    pub forwarder: Option<PortForwarder>,
+}
+
+/// Opens TCP connections to the remote host's loopback over the existing SSH
+/// connection (direct-tcpip channels).
+#[derive(Clone)]
+pub struct PortForwarder {
+    handle: Arc<client::Handle<SshHandler>>,
+}
+
+impl PortForwarder {
+    pub async fn open(
+        &self,
+        host: &str,
+        port: u16,
+        originator: std::net::SocketAddr,
+    ) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
+        let channel = self
+            .handle
+            .channel_open_direct_tcpip(
+                host,
+                u32::from(port),
+                originator.ip().to_string(),
+                u32::from(originator.port()),
+            )
+            .await
+            .with_context(|| format!("failed to open SSH forward to {host}:{port}"))?;
+        Ok(channel.into_stream())
+    }
 }
 
 
@@ -69,16 +107,13 @@ fn parse_ssh_host(host_str: &str) -> (Option<String>, String, u16) {
 }
 
 /// Connect to a remote host via SSH and exec `mux bridge --session <name>`.
-/// Returns a (reader, writer) pair for the SSH channel.
+/// Returns the SSH channel's reader/writer plus an optional port forwarder.
 pub async fn connect(
     host_str: &str,
     session_name: &str,
     program: &[String],
     options: &SshOptions,
-) -> Result<(
-    Box<dyn AsyncRead + Unpin + Send>,
-    Box<dyn AsyncWrite + Unpin + Send>,
-)> {
+) -> Result<SshConn> {
     let (user, host, port) = parse_ssh_host(host_str);
     let username = user.unwrap_or_else(|| {
         std::env::var("USER").unwrap_or_else(|_| "root".to_string())
@@ -153,7 +188,14 @@ pub async fn connect(
     // Convert to AsyncRead + AsyncWrite stream and split
     let stream = channel.into_stream();
     let (reader, writer) = tokio::io::split(stream);
-    Ok((Box::new(reader), Box::new(writer)))
+    let forwarder = options.forward_callbacks.then(|| PortForwarder {
+        handle: Arc::new(session),
+    });
+    Ok(SshConn {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        forwarder,
+    })
 }
 
 /// Try authenticating via SSH agent. Returns true on success.

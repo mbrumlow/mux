@@ -3,11 +3,26 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 pub struct SshConfig {
     /// Enable zlib compression for SSH connections.
     #[serde(default)]
     pub compression: bool,
+    /// When a URL opened from a remote session carries a loopback callback
+    /// (e.g. `redirect_uri=http://127.0.0.1:PORT/...`), listen on that port
+    /// locally and relay it to the remote host. Default: true.
+    #[serde(default = "default_true")]
+    pub forward_callbacks: bool,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self { compression: false, forward_callbacks: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Default, Deserialize)]

@@ -1,4 +1,5 @@
 pub mod detach;
+pub mod forward;
 pub mod input;
 pub mod kkp;
 pub mod net;
@@ -64,6 +65,7 @@ fn handle_server_msg(
     last_ping: &Option<(u64, Instant)>,
     last_rtt_ms: &mut Option<u64>,
     kkp_translator: &mut kkp::KkpTranslator,
+    forwarder: Option<&ssh::PortForwarder>,
 ) -> std::io::Result<MsgAction> {
     match msg {
         S2C::Snapshot(snapshot) => {
@@ -162,6 +164,15 @@ fn handle_server_msg(
             }
         }
         S2C::OpenUrl { url } => {
+            // Auth flows that redirect to a loopback port expect it on the
+            // remote host: listen locally and relay before the browser opens.
+            if let Some(forwarder) = forwarder {
+                if let Some(cb) = forward::detect_callback(&url) {
+                    if let Err(e) = forward::start(forwarder.clone(), cb) {
+                        warn!(port = cb.port, "callback forward not started: {e}");
+                    }
+                }
+            }
             // Fire-and-forget: open URL in the client's local browser
             let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
             match std::process::Command::new(cmd)
@@ -229,6 +240,7 @@ async fn run_session(
     display_host: &str,
     is_remote: bool,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    forwarder: Option<ssh::PortForwarder>,
 ) -> Result<(ExitReason, Option<mpsc::Receiver<S2C>>)> {
     // Get terminal size (clamped so the PTY never sees a 0 dimension)
     let (cols, rows) = terminal_size_clamped();
@@ -416,6 +428,7 @@ async fn run_session(
                                 msg, &mut stdout, &mut outer_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
                                 &last_ping, &mut last_rtt_ms, &mut kkp_translator,
+                                forwarder.as_ref(),
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;
@@ -467,6 +480,7 @@ async fn run_session(
                                 msg, &mut stdout, &mut outer_kkp_active,
                                 &mut local_dec_modes, &mut last_pong,
                                 &last_ping, &mut last_rtt_ms, &mut kkp_translator,
+                                forwarder.as_ref(),
                             )? {
                                 MsgAction::Exit(reason) => {
                                     exit_reason = reason;
@@ -643,6 +657,7 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
             &hostname,
             false,
             &mut stdin_rx,
+            None, // local session: callbacks already land on this machine
         )
         .await
         {
@@ -819,9 +834,9 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             }
         };
 
-        let (reader, writer) = ssh_conn;
+        let ssh::SshConn { reader, writer, forwarder } = ssh_conn;
 
-        match run_session(reader, writer, session, host, true, &mut stdin_rx).await {
+        match run_session(reader, writer, session, host, true, &mut stdin_rx, forwarder).await {
             Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
             Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
             Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
