@@ -258,10 +258,18 @@ async fn run_session(
             height: rows,
         },
     };
-    write_frame_async(&mut writer, &hello).await?;
-
-    // Read Welcome
-    let welcome: S2C = read_frame_async(&mut reader).await?;
+    let handshake = async {
+        write_frame_async(&mut writer, &hello).await?;
+        read_frame_async::<_, S2C>(&mut reader).await
+    };
+    let welcome = if is_remote {
+        match wait_for_connection(handshake, stdin_rx).await {
+            Some(welcome) => welcome?,
+            None => return Ok((ExitReason::Detached, None)),
+        }
+    } else {
+        handshake.await?
+    };
     match &welcome {
         S2C::Welcome { session_id } => {
             info!(session_id, "connected to server");
@@ -710,6 +718,28 @@ enum ReconnectAction {
     Exit,
 }
 
+/// Keep exit keys responsive throughout connection setup, including a stalled
+/// SSH connection or Welcome handshake. Pin once so unrelated input does not
+/// cancel and restart the connection attempt.
+async fn wait_for_connection<F: std::future::Future>(
+    connection: F,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> Option<F::Output> {
+    tokio::pin!(connection);
+    loop {
+        tokio::select! {
+            biased;
+            data = stdin_rx.recv() => {
+                match data {
+                    Some(data) if !matches!(classify_overlay_input(&data), OverlayKey::Exit) => {}
+                    _ => return None,
+                }
+            }
+            result = &mut connection => return Some(result),
+        }
+    }
+}
+
 /// Wait for manual user input only (no countdown, no server_rx).
 /// Used when a remote client is kicked — the user must explicitly choose to reclaim.
 async fn wait_for_manual_action(
@@ -819,12 +849,16 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
 
     let result: Result<Option<ExitReason>> = loop {
         // Connect via SSH
-        let ssh_conn = match ssh::connect(host, session, program, ssh_options).await {
-            Ok(conn) => {
+        let ssh_conn = match wait_for_connection(
+            ssh::connect(host, session, program, ssh_options),
+            &mut stdin_rx,
+        ).await {
+            None => break Ok(Some(ExitReason::Detached)),
+            Some(Ok(conn)) => {
                 attempt = 0;
                 conn
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 attempt += 1;
                 warn!("SSH connection failed (attempt {attempt}): {e:#}");
                 match show_reconnect_overlay(host, session, attempt, &mut stdin_rx).await {
@@ -877,7 +911,54 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_overlay_input, OverlayKey};
+    use super::{classify_overlay_input, wait_for_connection, OverlayKey};
+    use tokio::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn exit_keys_cancel_stalled_connection() {
+        for key in [b"q".as_slice(), b"\x1b".as_slice()] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let task = tokio::spawn(async move {
+                wait_for_connection(std::future::pending::<()>(), &mut rx).await
+            });
+            tokio::task::yield_now().await;
+            // Ignore other keys without blocking a subsequent exit key.
+            tx.send(b"\x1b[A".to_vec()).await.unwrap();
+            tx.send(b"\r".to_vec()).await.unwrap();
+            tx.send(key.to_vec()).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await.unwrap().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn stdin_closed_cancels_stalled_connection() {
+        let (tx, mut rx) = mpsc::channel(1);
+        drop(tx);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_connection(std::future::pending::<()>(), &mut rx),
+        ).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn other_keys_do_not_restart_connection() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            wait_for_connection(async {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap()
+            }, &mut rx).await
+        });
+        started_rx.await.unwrap();
+        tx.send(b" ".to_vec()).await.unwrap();
+        finish_tx.send(42).unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await.unwrap().unwrap(), Some(42));
+    }
 
     #[test]
     fn lone_esc_exits() {
