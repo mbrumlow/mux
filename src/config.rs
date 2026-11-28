@@ -17,7 +17,10 @@ pub struct SshConfig {
 
 impl Default for SshConfig {
     fn default() -> Self {
-        Self { compression: false, forward_callbacks: true }
+        Self {
+            compression: false,
+            forward_callbacks: true,
+        }
     }
 }
 

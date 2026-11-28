@@ -24,10 +24,10 @@ pub struct FilterResult {
 enum State {
     Normal,
     GotPrefix,
-    Esc,        // saw ESC in Normal context
-    Csi,        // saw ESC [ in Normal context, accumulating params
-    PrefixEsc,  // saw ESC after GotPrefix
-    PrefixCsi,  // saw ESC [ after GotPrefix, accumulating params
+    Esc,       // saw ESC in Normal context
+    Csi,       // saw ESC [ in Normal context, accumulating params
+    PrefixEsc, // saw ESC after GotPrefix
+    PrefixCsi, // saw ESC [ after GotPrefix, accumulating params
 }
 
 pub struct DetachFilter {

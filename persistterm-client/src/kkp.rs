@@ -14,8 +14,8 @@ struct KkpEvent {
     keycode: u32,
     shifted_key: Option<u32>,
     base_key: Option<u32>,
-    modifiers: u32,    // 1 + modifier_bits (1 = no mods)
-    event_type: u32,   // 0=implicit press, 1=press, 2=repeat, 3=release
+    modifiers: u32,  // 1 + modifier_bits (1 = no mods)
+    event_type: u32, // 0=implicit press, 1=press, 2=repeat, 3=release
     text_codepoints: Vec<u32>,
 }
 
@@ -52,26 +52,20 @@ fn is_csi_final(b: u8) -> bool {
 fn parse_key_group(s: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
     let mut parts = s.split(':');
     let keycode: u32 = parts.next()?.parse().ok()?;
-    let shifted_key = parts.next().and_then(|p| {
-        if p.is_empty() { None } else { p.parse().ok() }
-    });
-    let base_key = parts.next().and_then(|p| {
-        if p.is_empty() { None } else { p.parse().ok() }
-    });
+    let shifted_key = parts
+        .next()
+        .and_then(|p| if p.is_empty() { None } else { p.parse().ok() });
+    let base_key = parts
+        .next()
+        .and_then(|p| if p.is_empty() { None } else { p.parse().ok() });
     Some((keycode, shifted_key, base_key))
 }
 
 /// Parse the modifier group (modifiers[:event_type])
 fn parse_modifier_group(s: &str) -> (u32, u32) {
     let mut parts = s.split(':');
-    let modifiers = parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1);
-    let event_type = parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
+    let modifiers = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+    let event_type = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     (modifiers, event_type)
 }
 
@@ -220,22 +214,21 @@ fn reencode_csi_u(ev: &KkpEvent, inner_flags: u32, out: &mut Vec<u8>) {
 
     // Keycode group
     write_u32(keycode, out);
-    if (inner_flags & REPORT_ALTERNATE_KEYS) != 0 {
-        if ev.shifted_key.is_some() || ev.base_key.is_some() {
+    if (inner_flags & REPORT_ALTERNATE_KEYS) != 0
+        && (ev.shifted_key.is_some() || ev.base_key.is_some())
+    {
+        out.push(b':');
+        if let Some(sk) = ev.shifted_key {
+            write_u32(sk, out);
+        }
+        if let Some(bk) = ev.base_key {
             out.push(b':');
-            if let Some(sk) = ev.shifted_key {
-                write_u32(sk, out);
-            }
-            if let Some(bk) = ev.base_key {
-                out.push(b':');
-                write_u32(bk, out);
-            }
+            write_u32(bk, out);
         }
     }
 
     // Modifier group — always emit if modifiers != 1, or if we need event_type
-    let need_event_type =
-        (inner_flags & REPORT_EVENT_TYPES) != 0 && ev.event_type > 0;
+    let need_event_type = (inner_flags & REPORT_EVENT_TYPES) != 0 && ev.event_type > 0;
     if has_modifiers || need_event_type {
         out.push(b';');
         write_u32(modifiers, out);
@@ -269,7 +262,7 @@ fn reencode_csi_u(ev: &KkpEvent, inner_flags: u32, out: &mut Vec<u8>) {
 fn is_printable_codepoint(cp: u32) -> bool {
     // Functional keys use codepoints >= 57344 (Unicode private use area)
     // Also exclude C0 control characters
-    cp >= 32 && cp < 57344
+    (32..57344).contains(&cp)
 }
 
 /// Write a u32 as decimal ASCII digits into a Vec.
@@ -347,6 +340,12 @@ fn is_kkp_functional_final(b: u8) -> bool {
     matches!(b, b'~' | b'A'..=b'H' | b'P' | b'Q' | b'S')
 }
 
+impl Default for KkpTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KkpTranslator {
     pub fn new() -> Self {
         Self {
@@ -363,7 +362,7 @@ impl KkpTranslator {
     /// Translate input data from outer terminal (flags=31) to inner app's KKP level.
     pub fn translate(&mut self, data: &[u8]) -> Vec<u8> {
         // Log raw input bytes for debugging modifier issues
-        if data.iter().any(|&b| b == ESC) {
+        if data.contains(&ESC) {
             let hex: Vec<String> = data.iter().map(|b| format!("{:02x}", b)).collect();
             info!(
                 inner_flags = self.inner_flags,
@@ -420,7 +419,10 @@ impl KkpTranslator {
                         //   \x1b[?...u  — KKP mode query response
                         //   \x1b[>...u  — KKP push echo
                         //   \x1b[<...u  — KKP pop echo
-                        if params.first().map_or(false, |&b| matches!(b, b'?' | b'>' | b'<')) {
+                        if params
+                            .first()
+                            .is_some_and(|&b| matches!(b, b'?' | b'>' | b'<'))
+                        {
                             // Silently drop — terminal responses (KKP query/push/pop), not user input
                         } else if self.inner_flags == 0 {
                             // No KKP translation active — pass through unchanged
@@ -453,7 +455,7 @@ impl KkpTranslator {
                         let params = &self.seq_buf[2..self.seq_buf.len() - 1];
                         let has_private_marker = params
                             .first()
-                            .map_or(false, |&p| matches!(p, b'?' | b'>' | b'='));
+                            .is_some_and(|&p| matches!(p, b'?' | b'>' | b'='));
                         if has_private_marker && b == b'c' {
                             // DA response (DA1: \x1b[?...c, DA2: \x1b[>...c) — drop
                         } else if is_kkp_functional_final(b) {
@@ -741,8 +743,8 @@ mod tests {
     fn text_codepoints_preserved_when_wanted() {
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1 | REPORT_ASSOCIATED_TEXT); // flags=17
-        // A key that still travels as CSI-u keeps its text field: shift alone
-        // would have made this text, so use a modifier that does not.
+                                                       // A key that still travels as CSI-u keeps its text field: shift alone
+                                                       // would have made this text, so use a modifier that does not.
         let result = t.translate(b"\x1b[97;6;65u");
         assert_eq!(result, b"\x1b[97;6;65u");
     }
@@ -907,7 +909,7 @@ mod tests {
     fn modifier_key_preserved_when_inner_wants_all_keys() {
         let mut t = KkpTranslator::new();
         t.set_inner_flags(1 | REPORT_ALL_KEYS_AS_ESCAPE_CODES); // flags=9
-        // Left Control press: \x1b[57442;1u
+                                                                // Left Control press: \x1b[57442;1u
         let result = t.translate(b"\x1b[57442;1u");
         assert_eq!(result, b"\x1b[57442u");
     }

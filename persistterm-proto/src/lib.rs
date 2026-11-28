@@ -1,7 +1,7 @@
-pub mod types;
-pub mod messages;
 pub mod codec;
+pub mod messages;
+pub mod types;
 
-pub use types::*;
-pub use messages::*;
 pub use codec::*;
+pub use messages::*;
+pub use types::*;

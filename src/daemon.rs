@@ -27,10 +27,7 @@ pub(crate) fn lock_session(name: &str) -> Result<File> {
     use std::os::unix::io::AsRawFd;
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
-        bail!(
-            "flock failed: {}",
-            std::io::Error::last_os_error()
-        );
+        bail!("flock failed: {}", std::io::Error::last_os_error());
     }
     Ok(file)
 }
@@ -38,7 +35,11 @@ pub(crate) fn lock_session(name: &str) -> Result<File> {
 /// Ensure a server is running for the given session name.
 /// If one is already alive, returns Ok immediately.
 /// If the socket is stale, removes it and starts a new server.
-pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
+pub fn ensure_server(
+    name: &str,
+    program: &[String],
+    initial_size: Option<(u16, u16)>,
+) -> Result<()> {
     // Hold an advisory lock to prevent two clients from racing
     let _lock = lock_session(name)?;
 
@@ -59,18 +60,20 @@ pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, 
     let log_file_err = log_file.try_clone().context("failed to clone log file")?;
 
     // Use the provided size (from remote client) or query the local terminal
-    let (cols, rows) = initial_size.unwrap_or_else(|| {
-        crossterm::terminal::size().unwrap_or((80, 24))
-    });
+    let (cols, rows) =
+        initial_size.unwrap_or_else(|| crossterm::terminal::size().unwrap_or((80, 24)));
 
     // Re-exec ourselves as: mux server --session <name>
     let exe = std::env::current_exe().context("failed to get current exe")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args([
         "server",
-        "--session", name,
-        "--rows", &rows.to_string(),
-        "--cols", &cols.to_string(),
+        "--session",
+        name,
+        "--rows",
+        &rows.to_string(),
+        "--cols",
+        &cols.to_string(),
     ]);
     if !program.is_empty() {
         cmd.arg("--");
@@ -102,7 +105,10 @@ pub fn ensure_server(name: &str, program: &[String], initial_size: Option<(u16, 
         }
     }
 
-    bail!("server failed to start within 5 seconds (check {})", paths::log_path(name).display());
+    bail!(
+        "server failed to start within 5 seconds (check {})",
+        paths::log_path(name).display()
+    );
 }
 
 /// Try a synchronous connect to verify a server is alive.
@@ -112,7 +118,11 @@ fn try_connect_sync(path: &Path) -> bool {
 
 /// Bridge stdin/stdout to a session socket (used by SSH remote).
 /// This is a pure byte relay — it does not parse protocol messages.
-pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, u16)>) -> Result<()> {
+pub fn run_bridge(
+    session: &str,
+    program: &[String],
+    initial_size: Option<(u16, u16)>,
+) -> Result<()> {
     // Update SSH agent symlink before connecting — the bridge inherits
     // SSH_AUTH_SOCK from sshd, so this points the stable symlink at the
     // real remote agent socket.
@@ -157,8 +167,7 @@ pub fn run_bridge(session: &str, program: &[String], initial_size: Option<(u16, 
 fn generate_browser_token() -> Result<String> {
     use std::io::Read;
     let mut buf = [0u8; 32];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .context("failed to open /dev/urandom")?;
+    let mut f = std::fs::File::open("/dev/urandom").context("failed to open /dev/urandom")?;
     f.read_exact(&mut buf)
         .context("failed to read from /dev/urandom")?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
@@ -186,10 +195,7 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
         "MUX_BROWSER_SOCKET".to_string(),
         browser_sock.to_string_lossy().into_owned(),
     ));
-    extra_env.push((
-        "MUX_BROWSER_TOKEN".to_string(),
-        browser_token.clone(),
-    ));
+    extra_env.push(("MUX_BROWSER_TOKEN".to_string(), browser_token.clone()));
     // $BROWSER must be a single executable path: many consumers (notably
     // Python's `webbrowser`, used by the AWS CLI) exec the whole value as one
     // program name rather than splitting it into command + arguments.
@@ -210,8 +216,14 @@ pub fn run_server(name: &str, rows: u16, cols: u16, program: &[String]) -> Resul
     rt.block_on(async {
         info!(?sock, rows, cols, "starting server for session {name}");
         let mut session = persistterm_server::session::Session::new(
-            name, rows, cols, &sock, &resolved_program, &extra_env,
-            Some(&browser_sock), &browser_token,
+            name,
+            rows,
+            cols,
+            &sock,
+            &resolved_program,
+            &extra_env,
+            Some(&browser_sock),
+            &browser_token,
         )?;
         session.run().await
     })

@@ -16,7 +16,9 @@ use cli::{Cli, Commands, SessionTarget};
 /// stays off unless RUST_LOG explicitly enables it.
 fn default_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("off,mux=info,persistterm_server=info,persistterm_client=info,persistterm_proto=info")
+        EnvFilter::new(
+            "off,mux=info,persistterm_server=info,persistterm_client=info,persistterm_proto=info",
+        )
     })
 }
 
@@ -36,7 +38,7 @@ fn open_url(url: &str) -> Result<()> {
     stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
 
-    write!(stream, "{token} {url}\n")?;
+    writeln!(stream, "{token} {url}")?;
     stream.flush()?;
 
     let mut reader = std::io::BufReader::new(&stream);
@@ -67,7 +69,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Server { session, rows, cols, program }) => {
+        Some(Commands::Server {
+            session,
+            rows,
+            cols,
+            program,
+        }) => {
             paths::validate_session_name(session)?;
 
             // Server subprocess: init tracing to file (no ANSI)
@@ -78,7 +85,12 @@ fn main() -> Result<()> {
 
             daemon::run_server(session, *rows, *cols, program)
         }
-        Some(Commands::Bridge { session, cols, rows, program }) => {
+        Some(Commands::Bridge {
+            session,
+            cols,
+            rows,
+            program,
+        }) => {
             paths::validate_session_name(session)?;
             let initial_size = cols.zip(*rows);
             daemon::run_bridge(session, program, initial_size)

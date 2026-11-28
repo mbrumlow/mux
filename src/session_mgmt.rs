@@ -13,9 +13,7 @@ pub fn list_sessions() -> Result<()> {
     }
 
     let mut found = false;
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
@@ -23,10 +21,7 @@ pub fn list_sessions() -> Result<()> {
         if path.extension().and_then(|s| s.to_str()) != Some("sock") {
             continue;
         }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("???");
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("???");
 
         // Skip agent symlinks (e.g. "mysession.agent.sock")
         // and browser sideband sockets (e.g. "mysession.browser.sock")
@@ -71,8 +66,8 @@ pub fn kill_session(name: &str) -> Result<()> {
     }
 
     // Connect and get the server PID via SO_PEERCRED
-    let stream = UnixStream::connect(&sock)
-        .with_context(|| format!("session '{name}' is not running"))?;
+    let stream =
+        UnixStream::connect(&sock).with_context(|| format!("session '{name}' is not running"))?;
 
     let pid = get_peer_pid(&stream)?;
     drop(stream);
@@ -105,8 +100,7 @@ pub fn kill_session(name: &str) -> Result<()> {
 
     // Clean up anything the server's own shutdown left behind
     let _ = std::fs::remove_file(&sock);
-    let lock_path = paths::socket_dir().join(format!("{name}.lock"));
-    let _ = std::fs::remove_file(lock_path);
+    // Keep the lock inode stable for concurrent holders and waiters.
     paths::remove_agent_link(name);
     paths::remove_browser_socket(name);
 
@@ -147,7 +141,12 @@ pub fn attach_remote(host: &str, session: &str, program: &[String]) -> Result<()
         .build()
         .context("failed to build tokio runtime")?;
 
-    rt.block_on(persistterm_client::run_remote(host, session, program, &ssh_options))
+    rt.block_on(persistterm_client::run_remote(
+        host,
+        session,
+        program,
+        &ssh_options,
+    ))
 }
 
 /// Get the PID of the peer process via socket credentials.

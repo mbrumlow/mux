@@ -52,7 +52,6 @@ impl PortForwarder {
     }
 }
 
-
 struct SshHandler {
     host: String,
     port: u16,
@@ -65,7 +64,8 @@ impl client::Handler for SshHandler {
         &mut self,
         server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match russh::keys::known_hosts::check_known_hosts(&self.host, self.port, server_public_key) {
+        match russh::keys::known_hosts::check_known_hosts(&self.host, self.port, server_public_key)
+        {
             Ok(true) => Ok(true),
             Ok(false) => {
                 bail!(
@@ -115,9 +115,8 @@ pub async fn connect(
     options: &SshOptions,
 ) -> Result<SshConn> {
     let (user, host, port) = parse_ssh_host(host_str);
-    let username = user.unwrap_or_else(|| {
-        std::env::var("USER").unwrap_or_else(|_| "root".to_string())
-    });
+    let username =
+        user.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
 
     let preferred = if options.compression {
         russh::Preferred {
@@ -165,11 +164,15 @@ pub async fn connect(
     let mux_bin = std::env::var("MUX_REMOTE_BIN").unwrap_or_else(|_| "mux".to_string());
     // Validate MUX_REMOTE_BIN to prevent command injection on the remote host.
     // Allow only path-like characters: alphanumeric, '/', '-', '_', '.'
-    if !mux_bin.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')) {
+    if !mux_bin
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
         bail!("MUX_REMOTE_BIN contains invalid characters: {mux_bin:?}");
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut command = format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
+    let mut command =
+        format!("{mux_bin} bridge --session {session_name} --cols {cols} --rows {rows}");
     if !program.is_empty() {
         command.push_str(" --");
         for arg in program {

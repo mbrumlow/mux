@@ -63,15 +63,13 @@ impl Default for CursorState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum Color {
     #[default]
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct CellStyle {

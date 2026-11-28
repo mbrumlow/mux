@@ -27,16 +27,34 @@ pub enum C2S {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum S2C {
-    Welcome { session_id: String },
+    Welcome {
+        session_id: String,
+    },
     Snapshot(ScreenSnapshot),
     Frame(Frame),
-    Kicked { reason: String },
-    Pong { t: u64 },
-    SetKkpMode { flags: u32 },
-    SetDecMode { mode: u16, enabled: bool },
-    Clipboard { params: String, data: String },
-    ScreenData { data: Vec<u8> },
-    ScreenDiff { data: Vec<u8> },
+    Kicked {
+        reason: String,
+    },
+    Pong {
+        t: u64,
+    },
+    SetKkpMode {
+        flags: u32,
+    },
+    SetDecMode {
+        mode: u16,
+        enabled: bool,
+    },
+    Clipboard {
+        params: String,
+        data: String,
+    },
+    ScreenData {
+        data: Vec<u8>,
+    },
+    ScreenDiff {
+        data: Vec<u8>,
+    },
     SessionInfo {
         session_name: String,
         server_version: String,
@@ -53,5 +71,7 @@ pub enum S2C {
     },
     SessionAvailable,
     SessionEnded,
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+    },
 }

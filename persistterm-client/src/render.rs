@@ -94,15 +94,15 @@ pub fn render_kicked_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std
     out.flush()
 }
 
-pub fn render_session_ended_overlay<W: Write>(out: &mut W, cols: u16, rows: u16) -> std::io::Result<()> {
+pub fn render_session_ended_overlay<W: Write>(
+    out: &mut W,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<()> {
     // Clear screen, reset attributes, hide cursor
     write!(out, "\x1b[0m\x1b[2J\x1b[?25l")?;
 
-    let lines: &[&str] = &[
-        "Session has ended.",
-        "",
-        "Press any key to exit.",
-    ];
+    let lines: &[&str] = &["Session has ended.", "", "Press any key to exit."];
 
     let start_row = rows.saturating_sub(lines.len() as u16) / 2 + 1;
 
@@ -259,7 +259,9 @@ pub fn render_session_info_overlay<W: Write>(
     let pid_str = info.pid.to_string();
     let child_pid_str = info.child_pid.map_or("N/A".to_string(), |p| p.to_string());
     let waiting_str = info.waiting_clients.to_string();
-    let latency_str = info.latency_ms.map_or("N/A".to_string(), |ms| format!("{ms}ms"));
+    let latency_str = info
+        .latency_ms
+        .map_or("N/A".to_string(), |ms| format!("{ms}ms"));
 
     // Key-value pairs (without Command): right-align keys, align ':'
     let kv: &[(&str, &str)] = &[

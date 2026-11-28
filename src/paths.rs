@@ -117,8 +117,7 @@ pub fn ensure_browser_helper() -> Result<PathBuf> {
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(&exe, &tmp)
         .with_context(|| format!("failed to create {}", tmp.display()))?;
-    fs::rename(&tmp, &link)
-        .with_context(|| format!("failed to create {}", link.display()))?;
+    fs::rename(&tmp, &link).with_context(|| format!("failed to create {}", link.display()))?;
     Ok(link)
 }
 
@@ -160,7 +159,11 @@ pub fn update_agent_link(name: &str) -> Result<bool> {
     fs::rename(&tmp, &link)
         .with_context(|| format!("failed to rename agent symlink to {}", link.display()))?;
 
-    debug!(?link, ?real_sock, "updated agent symlink for session {name}");
+    debug!(
+        ?link,
+        ?real_sock,
+        "updated agent symlink for session {name}"
+    );
     Ok(true)
 }
 
@@ -180,8 +183,7 @@ pub fn remove_browser_socket(name: &str) {
 /// Prevents attacks where an adversary pre-creates the directory with
 /// permissive permissions (e.g. in /tmp).
 fn verify_dir_security(path: &PathBuf) -> Result<()> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
 
     let uid = unsafe { libc::getuid() };
     if meta.uid() != uid {
@@ -197,12 +199,13 @@ fn verify_dir_security(path: &PathBuf) -> Result<()> {
     let mode = meta.mode() & 0o777;
     if mode != 0o700 {
         // Attempt to fix permissions before failing
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!(
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
                 "directory {} has mode {:04o} (expected 0700) and could not be fixed",
                 path.display(),
                 mode
-            ))?;
+            )
+        })?;
     }
 
     Ok(())

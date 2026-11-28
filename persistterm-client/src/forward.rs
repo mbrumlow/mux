@@ -13,6 +13,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use url::{Host, Url};
 
@@ -20,6 +22,11 @@ use crate::ssh::PortForwarder;
 
 /// How long a callback listener stays open waiting for the browser.
 const LISTEN_WINDOW: Duration = Duration::from_secs(300);
+const RELAY_LIFETIME: Duration = Duration::from_secs(120);
+const RELAY_IDLE: Duration = Duration::from_secs(30);
+// Process-wide budgets apply across ports, address families, and reconnects.
+static LISTENERS: Semaphore = Semaphore::const_new(8);
+static CONNECTIONS: Semaphore = Semaphore::const_new(16);
 
 /// Query parameters that carry the callback address in common auth flows.
 const CALLBACK_PARAMS: &[&str] = &[
@@ -101,6 +108,10 @@ fn parse_loopback(value: &str) -> Option<LoopbackCallback> {
 /// up before the caller opens the browser; the relay runs in the background
 /// and stops after [`LISTEN_WINDOW`]. Must be called inside a tokio runtime.
 pub fn start(forwarder: PortForwarder, cb: LoopbackCallback) -> std::io::Result<()> {
+    let listener_permit = LISTENERS
+        .try_acquire()
+        .map_err(|_| std::io::Error::other("callback listener limit reached"))?;
+    let deadline = tokio::time::Instant::now() + LISTEN_WINDOW;
     let mut listeners = Vec::new();
     let mut last_err = None;
     for addr in cb.local_addrs() {
@@ -124,54 +135,138 @@ pub fn start(forwarder: PortForwarder, cb: LoopbackCallback) -> std::io::Result<
     let remote_host = cb.remote_host();
     info!(port, remote_host, "callback forward: listening");
 
-    for listener in listeners {
-        let forwarder = forwarder.clone();
-        tokio::spawn(async move {
-            let accept_loop = async {
+    tokio::spawn(async move {
+        let _permit = listener_permit;
+        let mut tasks = tokio::task::JoinSet::new();
+        for listener in listeners {
+            let forwarder = forwarder.clone();
+            tasks.spawn(async move {
                 loop {
                     let (tcp, peer) = match listener.accept().await {
                         Ok(conn) => conn,
-                        Err(e) => {
-                            warn!(port, "callback forward: accept failed: {e}");
-                            break;
-                        }
+                        Err(_) => break,
+                    };
+                    let Ok(permit) = CONNECTIONS.try_acquire() else {
+                        warn!(port, "callback connection limit reached");
+                        continue;
                     };
                     let forwarder = forwarder.clone();
                     tokio::spawn(async move {
-                        relay(forwarder, tcp, peer, remote_host, port).await;
+                        let _permit = permit;
+                        // Includes SSH channel creation and all relay I/O. Existing
+                        // connections cannot outlive the listener's auth window.
+                        let relay_deadline =
+                            deadline.min(tokio::time::Instant::now() + RELAY_LIFETIME);
+                        let result = tokio::time::timeout_at(relay_deadline, async {
+                            let remote = forwarder.open(remote_host, port, peer).await?;
+                            relay_streams(tcp, remote, RELAY_IDLE).await?;
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            warn!(port, "callback relay ended or timed out");
+                        }
                     });
                 }
-            };
-            let _ = tokio::time::timeout(LISTEN_WINDOW, accept_loop).await;
-            info!(port, "callback forward: listener closed");
-        });
-    }
+            });
+        }
+        let _ = tokio::time::timeout_at(deadline, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        // Dropping JoinSet cancels both address-family listeners.
+        info!(port, "callback forward: listeners closed");
+    });
     Ok(())
 }
 
-async fn relay(
-    forwarder: PortForwarder,
-    mut tcp: tokio::net::TcpStream,
-    peer: SocketAddr,
-    remote_host: &'static str,
-    port: u16,
-) {
-    let mut remote = match forwarder.open(remote_host, port, peer).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            warn!(port, "callback forward: remote connect failed: {e:#}");
-            return;
-        }
-    };
-    match tokio::io::copy_bidirectional(&mut tcp, &mut remote).await {
-        Ok((up, down)) => info!(port, up, down, "callback forward: connection relayed"),
-        Err(e) => info!(port, "callback forward: connection ended: {e}"),
+/// Relay with a shared idle deadline, preserving TCP half-close semantics.
+async fn relay_streams<L, R>(mut left: L, mut right: R, idle: Duration) -> std::io::Result<()>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut left_buf = [0u8; 8192];
+    let mut right_buf = [0u8; 8192];
+    let (mut left_open, mut right_open) = (true, true);
+    while left_open || right_open {
+        tokio::time::timeout(idle, async {
+            tokio::select! {
+                n = left.read(&mut left_buf), if left_open => {
+                    let n = n?;
+                    if n == 0 {
+                        left_open = false;
+                        right.shutdown().await?;
+                    } else {
+                        right.write_all(&left_buf[..n]).await?;
+                        right.flush().await?;
+                    }
+                }
+                n = right.read(&mut right_buf), if right_open => {
+                    let n = n?;
+                    if n == 0 {
+                        right_open = false;
+                        left.shutdown().await?;
+                    } else {
+                        left.write_all(&right_buf[..n]).await?;
+                        left.flush().await?;
+                    }
+                }
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "callback relay idle"))??;
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_relay_closes_both_streams() {
+        let (left, mut peer_left) = tokio::io::duplex(64);
+        let (right, _peer_right) = tokio::io::duplex(64);
+        let err = relay_streams(left, right, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(peer_left.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_response_after_request_half_close() {
+        let (left, mut browser) = tokio::io::duplex(64);
+        let (right, mut server) = tokio::io::duplex(64);
+        let task = tokio::spawn(relay_streams(left, right, Duration::from_secs(1)));
+        browser.write_all(b"request").await.unwrap();
+        browser.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+        server.write_all(b"response").await.unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        browser.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"response");
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn callback_budgets_reject_excess_and_release_capacity() {
+        let connections: Vec<_> = (0..16)
+            .map(|_| CONNECTIONS.try_acquire().unwrap())
+            .collect();
+        assert!(CONNECTIONS.try_acquire().is_err());
+        drop(connections);
+        assert!(CONNECTIONS.try_acquire().is_ok());
+        let listeners: Vec<_> = (0..8).map(|_| LISTENERS.try_acquire().unwrap()).collect();
+        assert!(LISTENERS.try_acquire().is_err());
+        drop(listeners);
+        assert!(LISTENERS.try_acquire().is_ok());
+    }
 
     #[test]
     fn detects_aws_signin() {
@@ -180,19 +275,32 @@ mod tests {
                    &redirect_uri=http%3A%2F%2F127.0.0.1%3A45293%2Foauth%2Fcallback&code_challenge=x";
         assert_eq!(
             detect_callback(url),
-            Some(LoopbackCallback { host: LoopbackHost::V4, port: 45293 })
+            Some(LoopbackCallback {
+                host: LoopbackHost::V4,
+                port: 45293
+            })
         );
     }
 
     #[test]
     fn detects_localhost_and_v6() {
         assert_eq!(
-            detect_callback("https://accounts.example.com/o/auth?redirect_uri=http://localhost:8085/"),
-            Some(LoopbackCallback { host: LoopbackHost::Name, port: 8085 })
+            detect_callback(
+                "https://accounts.example.com/o/auth?redirect_uri=http://localhost:8085/"
+            ),
+            Some(LoopbackCallback {
+                host: LoopbackHost::Name,
+                port: 8085
+            })
         );
         assert_eq!(
-            detect_callback("https://idp.example.com/auth?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A9000%2Fcb"),
-            Some(LoopbackCallback { host: LoopbackHost::V6, port: 9000 })
+            detect_callback(
+                "https://idp.example.com/auth?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A9000%2Fcb"
+            ),
+            Some(LoopbackCallback {
+                host: LoopbackHost::V6,
+                port: 9000
+            })
         );
     }
 

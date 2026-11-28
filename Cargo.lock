@@ -2091,6 +2091,7 @@ dependencies = [
  "crossterm",
  "libc",
  "persistterm-client",
+ "persistterm-proto",
  "persistterm-server",
  "serde",
  "tokio",

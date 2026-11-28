@@ -59,9 +59,7 @@ pub enum Commands {
     },
     /// Internal: open a URL via the browser sideband channel
     #[command(hide = true, name = "open-url")]
-    OpenUrl {
-        url: String,
-    },
+    OpenUrl { url: String },
 }
 
 pub enum SessionTarget {

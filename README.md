@@ -91,6 +91,10 @@ Requirements and behavior:
   `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, and `~/.ssh/id_ecdsa`.
 - Your SSH agent is forwarded into the session, and the forwarding target is
   refreshed on each reconnect.
+- Callback forwarding permits at most eight active callback windows and sixteen
+  relay connections per client process. Listeners close after five minutes;
+  connections close after thirty seconds idle or two minutes total, and never
+  outlive their listener window. URLs are omitted from browser-request logs.
 
 ## Keybindings
 
@@ -141,6 +145,26 @@ forward_callbacks = true
   `${VAR}` expansion.
 - `MUX_REMOTE_BIN` overrides the path to the `mux` binary invoked on a remote
   host (default: `mux`).
+
+## Resource limits
+
+Terminal sizes are limited to 1,024 columns, 512 rows, and 65,536 total cells.
+Oversized resize requests disconnect the requesting client without ending the
+session. Input/control frames are limited to 64 KiB and server frames to 4 MiB;
+large pastes are sent incrementally. Screen updates are paced at no more than
+60 FPS. Client and server transport writes time out after one second, dropping
+stalled connections while preserving the session.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+The lifecycle tests cover reconnects, stalled transports, PTY backpressure,
+lock-file preservation, terminal-size limits, and frame pacing.
 
 ## Architecture
 

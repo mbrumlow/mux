@@ -2,8 +2,10 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum frame size: 16 MiB.
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum server frame size: 4 MiB (screen data and clipboard payloads).
+pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+/// Input/control frames are much smaller than screen frames.
+pub const MAX_CLIENT_FRAME_SIZE: u32 = 64 * 1024;
 
 /// Serialize a value into a single `length ‖ payload` buffer, so a frame
 /// goes out in one write (one syscall / one SSH packet) instead of two.
@@ -41,8 +43,7 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> io::
     }
     let mut payload = vec![0u8; len as usize];
     reader.read_exact(&mut payload)?;
-    postcard::from_bytes(&payload)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    postcard::from_bytes(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Async frame I/O (requires the `tokio` feature).
@@ -70,10 +71,19 @@ pub mod async_io {
         R: AsyncReadExt + Unpin,
         T: for<'de> Deserialize<'de>,
     {
+        read_frame_async_limited(reader, MAX_FRAME_SIZE).await
+    }
+
+    /// Reject oversized payloads before allocating or deserializing them.
+    pub async fn read_frame_async_limited<R, T>(reader: &mut R, limit: u32) -> std::io::Result<T>
+    where
+        R: AsyncReadExt + Unpin,
+        T: for<'de> Deserialize<'de>,
+    {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf);
-        if len > MAX_FRAME_SIZE {
+        if len > limit.min(MAX_FRAME_SIZE) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "frame exceeds MAX_FRAME_SIZE",
@@ -89,7 +99,7 @@ pub mod async_io {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::{C2S, ClientCapabilities, S2C};
+    use crate::messages::{ClientCapabilities, C2S, S2C};
     use crate::types::{Cell, CellStyle, Color, CursorState, ScreenSnapshot};
 
     #[test]
@@ -220,11 +230,18 @@ mod tests {
 
     #[test]
     fn frame_too_large() {
-        // Create a message that would exceed MAX_FRAME_SIZE if we lower the limit check
-        let msg = C2S::RawInput { data: vec![0; 100] };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &msg).unwrap();
-        // Normal size should succeed
-        let _: C2S = read_frame(&mut buf.as_slice()).unwrap();
+        let header = (MAX_FRAME_SIZE + 1).to_be_bytes();
+        let err = read_frame::<_, C2S>(&mut header.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let msg = C2S::RawInput {
+            data: vec![0; MAX_FRAME_SIZE as usize],
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            write_frame(&mut output, &msg).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(output.is_empty());
     }
 }

@@ -4,6 +4,7 @@ pub mod input;
 pub mod kkp;
 pub mod net;
 pub mod render;
+mod resize;
 pub mod ssh;
 
 use std::io::Write;
@@ -15,8 +16,20 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use persistterm_proto::codec::async_io::{read_frame_async, write_frame_async};
-use persistterm_proto::{C2S, ClientCapabilities, S2C};
+use persistterm_proto::codec::async_io::{read_frame_async, write_frame_async as write_frame};
+use persistterm_proto::{ClientCapabilities, C2S, S2C};
+
+/// A failed or timed-out frame is never retried on the same connection.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn write_frame_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &C2S,
+) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_frame(writer, message))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "server write stalled"))?
+}
 
 const MUX_VERSION: &str = match option_env!("MUX_VERSION") {
     Some(v) => v,
@@ -174,7 +187,11 @@ fn handle_server_msg(
                 }
             }
             // Fire-and-forget: open URL in the client's local browser
-            let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            let cmd = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
             match std::process::Command::new(cmd)
                 .arg(&url)
                 .stdin(std::process::Stdio::null())
@@ -182,8 +199,8 @@ fn handle_server_msg(
                 .stderr(std::process::Stdio::null())
                 .spawn()
             {
-                Ok(_) => info!(url, "opened URL in local browser"),
-                Err(e) => error!(url, "failed to open URL: {e}"),
+                Ok(_) => info!("opened URL in local browser"),
+                Err(e) => error!("failed to open URL: {e}"),
             }
         }
         _ => {}
@@ -286,13 +303,20 @@ async fn run_session(
     {
         let mut stdout = std::io::stdout();
         // Save current title on the XTERM title stack, then set our title
-        let _ = write!(stdout, "\x1b[?1004l\x1b[22;0t\x1b]0;{display_host}/{session_name}\x07");
+        let _ = write!(
+            stdout,
+            "\x1b[?1004l\x1b[22;0t\x1b]0;{display_host}/{session_name}\x07"
+        );
         let _ = stdout.flush();
     }
 
+    // Four frames at up to 4 MiB each bound queued wire payloads to 16 MiB.
     // Spawn task to read server messages
-    let (server_tx, server_rx) = mpsc::channel::<S2C>(64);
+    let (server_tx, server_rx) = mpsc::channel::<S2C>(4);
     tokio::spawn(async move {
+        tokio::select! {
+            _ = server_tx.closed() => {},
+            _ = async {
         loop {
             match read_frame_async::<_, S2C>(&mut reader).await {
                 Ok(msg) => {
@@ -308,11 +332,18 @@ async fn run_session(
                 }
             }
         }
+
+            } => {},
+        }
     });
 
     // SIGWINCH handler
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+
+    let mut resize = resize::ResizeDebounce::new((cols, rows));
+    // Catch size changes that occurred while the initial handshake was running.
+    resize.signal(tokio::time::Instant::now());
 
     let mut detach_filter = detach::DetachFilter::new();
     let mut stdout = std::io::stdout();
@@ -338,11 +369,10 @@ async fn run_session(
 
     let result: Result<()> = async {
         loop {
-            // biased; ensures input is always forwarded before rendering output
+            // Fair selection prevents continuous input from starving keepalives.
             tokio::select! {
-                biased;
 
-                // Local stdin → send to server (highest priority)
+                // Local stdin → send to server
                 data = stdin_rx.recv() => {
                     let Some(data) = data else {
                         // stdin closed (terminal gone / EOF) — detach rather
@@ -398,10 +428,21 @@ async fn run_session(
                     }
                 }
 
-                // Terminal resize
+                // Coalesce resize signals; keep input and server messages responsive.
                 _ = sigwinch.recv() => {
-                    let (cols, rows) = terminal_size_clamped();
-                    write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
+                    resize.signal(tokio::time::Instant::now());
+                }
+                _ = async {
+                    match resize.deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some((cols, rows)) = resize.flush_due(
+                        tokio::time::Instant::now(), terminal_size_clamped(),
+                    ) {
+                        write_frame_async(&mut writer, &C2S::Resize { width: cols, height: rows }).await?;
+                    }
                 }
 
                 // Application-layer keepalive (remote sessions only)
@@ -419,7 +460,7 @@ async fn run_session(
                     write_frame_async(&mut writer, &C2S::Ping { t }).await?;
                 }
 
-                // Server messages (lowest priority — render after input is handled)
+                // Server messages
                 msg = async {
                     match server_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -675,10 +716,7 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
                 let mut stdout = std::io::stdout();
                 let _ = render::render_kicked_overlay(&mut stdout, cols, rows);
 
-                let action = wait_for_overlay_action(
-                    &mut stdin_rx,
-                    server_rx.as_mut(),
-                ).await;
+                let action = wait_for_overlay_action(&mut stdin_rx, server_rx.as_mut()).await;
 
                 match action {
                     OverlayAction::Reconnect => {
@@ -702,7 +740,9 @@ pub async fn run(sock_path: &Path, session_name: &str) -> Result<()> {
             Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
             Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
             Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
-            Ok((ExitReason::ServerDisconnected, _)) => break Ok(Some(ExitReason::ServerDisconnected)),
+            Ok((ExitReason::ServerDisconnected, _)) => {
+                break Ok(Some(ExitReason::ServerDisconnected))
+            }
             Err(e) => break Err(e),
         }
     };
@@ -742,9 +782,7 @@ async fn wait_for_connection<F: std::future::Future>(
 
 /// Wait for manual user input only (no countdown, no server_rx).
 /// Used when a remote client is kicked — the user must explicitly choose to reclaim.
-async fn wait_for_manual_action(
-    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
-) -> ReconnectAction {
+async fn wait_for_manual_action(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> ReconnectAction {
     loop {
         match stdin_rx.recv().await {
             Some(data) => match classify_overlay_input(&data) {
@@ -772,7 +810,13 @@ async fn show_reconnect_overlay(
     let mut remaining = countdown_secs;
 
     let _ = render::render_reconnect_overlay(
-        &mut stdout, cols, rows, host, session, attempt, remaining,
+        &mut stdout,
+        cols,
+        rows,
+        host,
+        session,
+        attempt,
+        remaining,
     );
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -812,11 +856,14 @@ fn cleanup_terminal(session_name: &str, result: &Result<Option<ExitReason>>) {
     let _ = crossterm::terminal::disable_raw_mode();
     let mut stdout = std::io::stdout();
     // Defensive: disable common DEC modes that break terminal usability
-    let _ = write!(stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l"); // mouse tracking + focus
+    let _ = write!(
+        stdout,
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l"
+    ); // mouse tracking + focus
     let _ = write!(stdout, "\x1b[?2004l"); // bracketed paste
     let _ = write!(stdout, "\x1b[?1049l"); // alternate screen buffer
     let _ = write!(stdout, "\x1b[?2026l"); // synchronized update
-    // KKP pop, reset attrs, clear screen, cursor home, show cursor, restore title
+                                           // KKP pop, reset attrs, clear screen, cursor home, show cursor, restore title
     let _ = write!(stdout, "\x1b[<u\x1b[0m\x1b[2J\x1b[H\x1b[?25h\x1b[23;0t");
     let _ = stdout.flush();
 
@@ -839,7 +886,12 @@ fn cleanup_terminal(session_name: &str, result: &Result<Option<ExitReason>>) {
 }
 
 /// Attach to a remote session over SSH with automatic reconnection.
-pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_options: &ssh::SshOptions) -> Result<()> {
+pub async fn run_remote(
+    host: &str,
+    session: &str,
+    program: &[String],
+    ssh_options: &ssh::SshOptions,
+) -> Result<()> {
     let _raw = input::RawInput::enable()?;
 
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -852,7 +904,9 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
         let ssh_conn = match wait_for_connection(
             ssh::connect(host, session, program, ssh_options),
             &mut stdin_rx,
-        ).await {
+        )
+        .await
+        {
             None => break Ok(Some(ExitReason::Detached)),
             Some(Ok(conn)) => {
                 attempt = 0;
@@ -868,9 +922,23 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
             }
         };
 
-        let ssh::SshConn { reader, writer, forwarder } = ssh_conn;
+        let ssh::SshConn {
+            reader,
+            writer,
+            forwarder,
+        } = ssh_conn;
 
-        match run_session(reader, writer, session, host, true, &mut stdin_rx, forwarder).await {
+        match run_session(
+            reader,
+            writer,
+            session,
+            host,
+            true,
+            &mut stdin_rx,
+            forwarder,
+        )
+        .await
+        {
             Ok((ExitReason::Detached, _)) => break Ok(Some(ExitReason::Detached)),
             Ok((ExitReason::Killed, _)) => break Ok(Some(ExitReason::Killed)),
             Ok((ExitReason::SessionEnded, _)) => break Ok(Some(ExitReason::SessionEnded)),
@@ -888,7 +956,10 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
                 let mut stdout = std::io::stdout();
                 let _ = render::render_remote_kicked_overlay(&mut stdout, cols, rows);
                 match wait_for_manual_action(&mut stdin_rx).await {
-                    ReconnectAction::Retry => { attempt = 0; continue; }
+                    ReconnectAction::Retry => {
+                        attempt = 0;
+                        continue;
+                    }
                     ReconnectAction::Exit => break Ok(Some(ExitReason::Detached)),
                 }
             }
@@ -912,8 +983,18 @@ pub async fn run_remote(host: &str, session: &str, program: &[String], ssh_optio
 #[cfg(test)]
 mod tests {
     use super::{classify_overlay_input, wait_for_connection, OverlayKey};
-    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stalled_transport_write_expires() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let err = super::write_frame_async(&mut writer, &persistterm_proto::C2S::Ping { t: 1 })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn exit_keys_cancel_stalled_connection() {
@@ -928,7 +1009,10 @@ mod tests {
             tx.send(b"\r".to_vec()).await.unwrap();
             tx.send(key.to_vec()).await.unwrap();
             assert!(tokio::time::timeout(Duration::from_secs(1), task)
-                .await.unwrap().unwrap().is_none());
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -939,7 +1023,10 @@ mod tests {
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
             wait_for_connection(std::future::pending::<()>(), &mut rx),
-        ).await.unwrap().is_none());
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -948,16 +1035,25 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            wait_for_connection(async {
-                started_tx.send(()).unwrap();
-                finish_rx.await.unwrap()
-            }, &mut rx).await
+            wait_for_connection(
+                async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap()
+                },
+                &mut rx,
+            )
+            .await
         });
         started_rx.await.unwrap();
         tx.send(b" ".to_vec()).await.unwrap();
         finish_tx.send(42).unwrap();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(1), task)
-            .await.unwrap().unwrap(), Some(42));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(42)
+        );
     }
 
     #[test]
@@ -967,7 +1063,10 @@ mod tests {
 
     #[test]
     fn arrow_key_is_ignored() {
-        assert!(matches!(classify_overlay_input(b"\x1b[A"), OverlayKey::Other));
+        assert!(matches!(
+            classify_overlay_input(b"\x1b[A"),
+            OverlayKey::Other
+        ));
     }
 
     #[test]
@@ -982,15 +1081,27 @@ mod tests {
     #[test]
     fn escape_sequences_are_skipped_whole() {
         // KKP-encoded 'q' must not exit
-        assert!(matches!(classify_overlay_input(b"\x1b[113u"), OverlayKey::Other));
+        assert!(matches!(
+            classify_overlay_input(b"\x1b[113u"),
+            OverlayKey::Other
+        ));
         // Mouse SGR report (contains a space-free param region + final byte)
-        assert!(matches!(classify_overlay_input(b"\x1b[<0;33;22M"), OverlayKey::Other));
+        assert!(matches!(
+            classify_overlay_input(b"\x1b[<0;33;22M"),
+            OverlayKey::Other
+        ));
         // SS3 arrow
-        assert!(matches!(classify_overlay_input(b"\x1bOA"), OverlayKey::Other));
+        assert!(matches!(
+            classify_overlay_input(b"\x1bOA"),
+            OverlayKey::Other
+        ));
     }
 
     #[test]
     fn key_after_sequence_still_counts() {
-        assert!(matches!(classify_overlay_input(b"\x1b[A\r"), OverlayKey::Confirm));
+        assert!(matches!(
+            classify_overlay_input(b"\x1b[A\r"),
+            OverlayKey::Confirm
+        ));
     }
 }

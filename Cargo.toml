@@ -23,3 +23,6 @@ libc = "0.2"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[dev-dependencies]
+persistterm-proto = { path = "persistterm-proto" }

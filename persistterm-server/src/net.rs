@@ -30,20 +30,14 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-        // Clean up the advisory lock file alongside the socket
-        let lock_path = self.path.with_extension("lock");
-        let _ = std::fs::remove_file(lock_path);
+        // Keep lock files: unlinking allows new callers to lock a different inode.
         // Clean up the SSH agent symlink (e.g. "mysession.agent.sock")
         // and browser sideband socket (e.g. "mysession.browser.sock")
         if let Some(stem) = self.path.file_stem() {
             let stem = stem.to_string_lossy();
-            let agent_path = self.path.with_file_name(
-                format!("{stem}.agent.sock"),
-            );
+            let agent_path = self.path.with_file_name(format!("{stem}.agent.sock"));
             let _ = std::fs::remove_file(agent_path);
-            let browser_path = self.path.with_file_name(
-                format!("{stem}.browser.sock"),
-            );
+            let browser_path = self.path.with_file_name(format!("{stem}.browser.sock"));
             let _ = std::fs::remove_file(browser_path);
         }
     }

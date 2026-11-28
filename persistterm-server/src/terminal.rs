@@ -274,7 +274,8 @@ impl Terminal {
             }
         }
 
-        let has_valid_prev = matches!(&self.prev_frame, Some(prev) if prev.line_renders.len() == rows);
+        let has_valid_prev =
+            matches!(&self.prev_frame, Some(prev) if prev.line_renders.len() == rows);
 
         if !has_valid_prev {
             // No valid previous frame — capture and return full screen
@@ -345,7 +346,8 @@ impl Terminal {
                     if row >= region_top && row < region_bot {
                         let src = row + abs_shift;
                         if src < region_bot && src < prev_frame.line_renders.len() {
-                            new_renders[row] = Some(std::mem::take(&mut prev_frame.line_renders[src]));
+                            new_renders[row] =
+                                Some(std::mem::take(&mut prev_frame.line_renders[src]));
                             new_seqnos[row] = prev_frame.line_seqnos[src];
                         }
                         // else: new line at bottom of region, will be rendered below
@@ -355,7 +357,10 @@ impl Terminal {
                         new_seqnos[row] = prev_frame.line_seqnos[row];
                     }
                 }
-                prev_frame.line_renders = new_renders.into_iter().map(|r| r.unwrap_or_default()).collect();
+                prev_frame.line_renders = new_renders
+                    .into_iter()
+                    .map(|r| r.unwrap_or_default())
+                    .collect();
                 prev_frame.line_seqnos = new_seqnos;
             } else if shift < 0 {
                 // Scroll down: lines moved down by |shift| rows
@@ -372,7 +377,8 @@ impl Terminal {
                         if row >= region_top + abs_shift {
                             let src = row - abs_shift;
                             if src >= region_top && src < prev_frame.line_renders.len() {
-                                new_renders[row] = Some(std::mem::take(&mut prev_frame.line_renders[src]));
+                                new_renders[row] =
+                                    Some(std::mem::take(&mut prev_frame.line_renders[src]));
                                 new_seqnos[row] = prev_frame.line_seqnos[src];
                             }
                         }
@@ -382,7 +388,10 @@ impl Terminal {
                         new_seqnos[row] = prev_frame.line_seqnos[row];
                     }
                 }
-                prev_frame.line_renders = new_renders.into_iter().map(|r| r.unwrap_or_default()).collect();
+                prev_frame.line_renders = new_renders
+                    .into_iter()
+                    .map(|r| r.unwrap_or_default())
+                    .collect();
                 prev_frame.line_seqnos = new_seqnos;
             }
         }
@@ -411,9 +420,9 @@ impl Terminal {
                         && !line.changed_since(prev_frame.line_seqnos[row])
                         && !prev_frame.line_renders[row].is_empty()
                     {
-                        new_frame.line_renders.push(
-                            std::mem::take(&mut prev_frame.line_renders[row]),
-                        );
+                        new_frame
+                            .line_renders
+                            .push(std::mem::take(&mut prev_frame.line_renders[row]));
                         new_frame.line_seqnos.push(prev_frame.line_seqnos[row]);
                         continue;
                     }
@@ -423,9 +432,7 @@ impl Terminal {
                     render_line_ansi(&mut buf, line, cols);
 
                     // Compare with cached render
-                    if row < prev_frame.line_renders.len()
-                        && buf == prev_frame.line_renders[row]
-                    {
+                    if row < prev_frame.line_renders.len() && buf == prev_frame.line_renders[row] {
                         // Content identical even though seqno changed
                         new_frame.line_renders.push(buf);
                         new_frame.line_seqnos.push(line_seqno);
@@ -655,11 +662,7 @@ fn write_scroll_region(out: &mut Vec<u8>, top: usize, bot: usize) {
 /// Render a single line's visible cells to ANSI bytes.
 /// Emits SGR only when attributes change from the previous cell.
 /// Pads to `cols` width so no separate erase-line is needed.
-fn render_line_ansi(
-    out: &mut Vec<u8>,
-    line: &tattoy_wezterm_term::Line,
-    cols: usize,
-) {
+fn render_line_ansi(out: &mut Vec<u8>, line: &tattoy_wezterm_term::Line, cols: usize) {
     let mut last_attrs: Option<tattoy_termwiz::cell::CellAttributes> = None;
     let mut col_count = 0usize;
 
@@ -836,9 +839,7 @@ fn is_partial_escape(rest: &[u8]) -> bool {
         // Lone ESC, "ESC [", or "ESC ]" at the very end of the chunk.
         [0x1b] | [0x1b, b'['] | [0x1b, b']'] => true,
         // DEC private mode ("ESC [ ?"), params still incomplete.
-        [0x1b, b'[', b'?', params @ ..] => {
-            params.iter().all(|&b| b.is_ascii_digit() || b == b';')
-        }
+        [0x1b, b'[', b'?', params @ ..] => params.iter().all(|&b| b.is_ascii_digit() || b == b';'),
         _ => false,
     }
 }
@@ -898,11 +899,7 @@ fn scan_pty_output(
             break;
         }
 
-        if data[i] == 0x1b
-            && i + 1 < data.len()
-            && data[i + 1] == b'['
-            && i + 2 < data.len()
-        {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' && i + 2 < data.len() {
             if data[i + 2] == b'?' {
                 // Scan past digits and semicolons to find the final byte
                 let mut j = i + 3;
@@ -960,7 +957,6 @@ fn scan_pty_output(
         i += 1;
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1031,5 +1027,4 @@ mod tests {
         let ev2 = t.process(b"JD\x07");
         assert_eq!(ev2.osc_forwards, vec![b"52;c;QUJD".to_vec()]);
     }
-
 }
